@@ -1,7 +1,7 @@
-// API 基础配置（按平台区分：H5 用 localhost，小程序用 127.0.0.1，真机调试改为电脑局域网 IP）
+// API 基础配置（按平台区分：H5 走同源相对路径，由 nginx/vite 代理 /api 与 /ws；小程序用 127.0.0.1，真机调试改为电脑局域网 IP）
 // #ifdef H5
-const BASE_URL = "http://localhost:8002";
-const WS_URL = "ws://localhost:8002";
+const BASE_URL = "";
+const WS_URL = `${location.protocol === "https:" ? "wss://" : "ws://"}${location.host}`;
 // #endif
 // #ifdef MP-WEIXIN
 const BASE_URL = "http://127.0.0.1:8002";
@@ -145,3 +145,126 @@ export const learningApi = {
       data: { result },
     }),
 };
+
+// 语音 (ASR: 录音文件 -> 文本)
+// 后端端点: POST /api/speech/transcribe (multipart, 字段名 file), JWT 鉴权
+// H5 用原生 fetch + FormData (uniapp alpha 版 H5 的 uploadFile+Blob 直传有丢内容 bug);
+// App/小程序用 uni.uploadFile (filePath)
+// #ifdef H5
+export const speechApi = {
+  transcribe: async (
+    input: { filePath?: string; file?: Blob | any; mimeType?: string },
+    language?: string,
+  ) => {
+    const t = getToken();
+    const form = new FormData();
+
+    if (input.file) {
+      const ext =
+        (input.mimeType ?? "audio/webm").split("/")[1]?.split(";")[0] || "webm";
+      form.append("file", input.file, `record_${Date.now()}.${ext}`);
+    } else if (input.filePath) {
+      // blob: URL 或 data URL -> 转 Blob
+      const blob = await fetch(input.filePath).then((r) => r.blob());
+      form.append("file", blob, `record_${Date.now()}.${blob.type.split("/")[1] || "webm"}`);
+    }
+    if (language) form.append("language", language);
+
+    const resp = await fetch(`${BASE_URL}/api/speech/transcribe`, {
+      method: "POST",
+      headers: t ? { Authorization: `Bearer ${t}` } : {},
+      body: form,
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.status >= 200 && resp.status < 300) return data;
+    if (resp.status === 401) uni.reLaunch({ url: "/pages/index/index" });
+    throw data;
+  },
+  // TTS: 文本 -> 音频 Blob (H5 用 Blob URL 播放)
+  synthesize: async (text: string, voice?: string): Promise<Blob> => {
+    const t = getToken();
+    const resp = await fetch(`${BASE_URL}/api/speech/tts`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(t ? { Authorization: `Bearer ${t}` } : {}),
+      },
+      body: JSON.stringify({ text, voice }),
+    });
+    if (resp.status === 401) uni.reLaunch({ url: "/pages/index/index" });
+    if (!resp.ok) throw new Error("tts failed");
+    return resp.blob();
+  },
+};
+// #endif
+// #ifndef H5
+export const speechApi = {
+  transcribe: (
+    input: { filePath?: string; file?: Blob | any; mimeType?: string },
+    language?: string,
+  ) =>
+    new Promise<any>((resolve, reject) => {
+      const header: Record<string, string> = {};
+      const t = getToken();
+      if (t) header["Authorization"] = `Bearer ${t}`;
+
+      const options: any = {
+        url: `${BASE_URL}/api/speech/transcribe`,
+        name: "file",
+        header,
+        formData: language ? { language } : {},
+        success: (res: any) => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            try {
+              resolve(JSON.parse(res.data));
+            } catch {
+              resolve(res.data);
+            }
+          } else {
+            if (res.statusCode === 401) {
+              uni.reLaunch({ url: "/pages/index/index" });
+            }
+            try {
+              reject(JSON.parse(res.data));
+            } catch {
+              reject(res.data);
+            }
+          }
+        },
+        fail: (err) => reject(err),
+      };
+
+      if (input.filePath) {
+        options.filePath = input.filePath;
+      } else if (input.file) {
+        // 非 H5 无 Blob 直传, 理论不会走到; 保留防御
+        options.file = input.file;
+        options.fileType = "audio";
+      }
+      uni.uploadFile(options);
+    }),
+  // TTS: 文本 -> 音频 (小程序/App 用 arraybuffer, 后续接 uni.createInnerAudioContext)
+  synthesize: (text: string, voice?: string) =>
+    new Promise<any>((resolve, reject) => {
+      const header: Record<string, string> = { "Content-Type": "application/json" };
+      const t = getToken();
+      if (t) header["Authorization"] = `Bearer ${t}`;
+      uni.request({
+        url: `${BASE_URL}/api/speech/tts`,
+        method: "POST",
+        header,
+        data: { text, voice },
+        responseType: "arraybuffer",
+        success: (res: any) => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(res.data);
+          } else {
+            if (res.statusCode === 401) uni.reLaunch({ url: "/pages/index/index" });
+            reject(res.data);
+          }
+        },
+        fail: reject,
+      });
+    }),
+};
+// #endif

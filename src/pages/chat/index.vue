@@ -66,12 +66,22 @@
           :disabled="isThinking"
           @confirm="sendText"
         />
-        <view class="voice-btn" @touchstart="startRecord" @touchend="stopRecord">
-          <text>🎙️</text>
+        <view
+          class="voice-btn"
+          :class="{ recording }"
+          @touchstart="startRecord"
+          @touchend="stopRecord"
+          @touchcancel="stopRecord"
+        >
+          <text>{{ recording ? "⏺" : "🎙️" }}</text>
         </view>
         <view class="send-btn" v-if="inputText.trim()" @click="sendText">
           <text>发送</text>
         </view>
+      </view>
+      <view class="voice-tip" v-if="recording">
+        <text class="tip-dot"></text>
+        <text>{{ recognizing ? "正在识别..." : "松开结束录音" }}</text>
       </view>
     </view>
 
@@ -96,7 +106,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, nextTick } from "vue";
-import { conversationApi, learningApi, getToken, WS_URL } from "@/api";
+import { conversationApi, learningApi, speechApi, getToken, WS_URL } from "@/api";
 
 interface Message {
   id: number;
@@ -191,6 +201,7 @@ function handleWSMessage(payload: any) {
     isThinking.value = false;
     messages.value.push({ id: Date.now(), role: "assistant", content: data.text });
     scrollToBottom();
+    playTts(data.text); // AI 回复自动语音播放
   } else if (event === "error") {
     console.error("[chat] server error", data);
     isThinking.value = false;
@@ -199,7 +210,11 @@ function handleWSMessage(payload: any) {
 
 async function sendText() {
   const text = inputText.value.trim();
-  if (!text || isThinking.value) return;
+  if (!text) return;
+  if (isThinking.value) {
+    uni.showToast({ title: "AI 正在回复，请稍候", icon: "none" });
+    return;
+  }
 
   const msgId = Date.now();
   messages.value.push({ id: msgId, role: "user", content: text });
@@ -216,13 +231,145 @@ async function sendText() {
   sendWS(socketTask.value, "text", { conversation_id: conversationId.value, content: text });
 }
 
-function startRecord() { uni.showToast({ title: "语音功能开发中", icon: "none" }); }
-function stopRecord() {}
+// 录音管理器: H5 用原生 MediaRecorder (本 uniapp alpha 版 H5 不支持 uni.getRecorderManager),
+// App/小程序用 uni.getRecorderManager
+const recording = ref(false);
+const recognizing = ref(false);
+
+// #ifdef H5
+let h5Recorder: MediaRecorder | null = null;
+let h5Chunks: BlobPart[] = [];
+let h5Stream: MediaStream | null = null;
+
+function startRecord() {
+  if (recording.value || recognizing.value || isThinking.value) return;
+  if (!getToken()) {
+    uni.showToast({ title: "请先登录", icon: "none" });
+    return;
+  }
+  navigator.mediaDevices
+    .getUserMedia({ audio: true })
+    .then((stream) => {
+      h5Stream = stream;
+      h5Chunks = [];
+      const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
+      h5Recorder = new MediaRecorder(stream, { mimeType: mime });
+      h5Recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) h5Chunks.push(e.data);
+      };
+      h5Recorder.onstop = () => {
+        h5Stream?.getTracks().forEach((t) => t.stop());
+        h5Stream = null;
+        recording.value = false;
+        const blob = new Blob(h5Chunks, { type: mime });
+        h5Chunks = [];
+        console.log("[chat] record blob", blob.size, "bytes, mime:", mime);
+        if (blob.size > 0) doTranscribe({ file: blob, mimeType: mime });
+      };
+      h5Recorder.start();
+      recording.value = true;
+    })
+    .catch((err) => {
+      console.error("[chat] mic error", err);
+      uni.showToast({ title: "无法访问麦克风，请检查权限", icon: "none" });
+    });
+}
+
+function stopRecord() {
+  if (h5Recorder && h5Recorder.state !== "inactive") {
+    h5Recorder.stop();
+    h5Recorder = null;
+  }
+}
+// #endif
+
+// #ifndef H5
+const recorder = uni.getRecorderManager();
+
+recorder.onStart(() => {
+  recording.value = true;
+});
+recorder.onStop((res: any) => {
+  recording.value = false;
+  if (res?.tempFilePath) {
+    doTranscribe({ filePath: res.tempFilePath });
+  }
+});
+recorder.onError((err: any) => {
+  recording.value = false;
+  console.error("[chat] record error", err);
+  uni.showToast({ title: "录音失败", icon: "none" });
+});
+
+function startRecord() {
+  if (recording.value || recognizing.value || isThinking.value) return;
+  if (!getToken()) {
+    uni.showToast({ title: "请先登录", icon: "none" });
+    return;
+  }
+  recorder.start({ duration: 60000, sampleRate: 16000, format: "mp3" });
+}
+
+function stopRecord() {
+  recorder.stop();
+}
+// #endif
+
+async function doTranscribe(input: { filePath?: string; file?: Blob; mimeType?: string }) {
+  recognizing.value = true;
+  try {
+    const res = await speechApi.transcribe(input);
+    const text = (res?.text ?? "").trim();
+    if (!text) {
+      uni.showToast({ title: "没听清，请再说一次", icon: "none" });
+      return;
+    }
+    // AI 正在回复时禁止发送, 避免静默丢失; 明确提示用户
+    if (isThinking.value) {
+      uni.showToast({ title: "AI 正在回复，请稍候再说话", icon: "none" });
+      inputText.value = text; // 保留文本, 用户可稍后手动发送
+      return;
+    }
+    // 转写文本直接作为消息发送, 复用文本链路
+    inputText.value = text;
+    await sendText();
+  } catch (e: any) {
+    const msg = e?.message ?? "";
+    uni.showToast({
+      title: msg.includes("429") || msg.includes("余额") ? "语音服务额度不足" : "识别失败，请重试",
+      icon: "none",
+    });
+  } finally {
+    recognizing.value = false;
+  }
+}
 
 function recordWord(content: string) {
   recordText.value = content.slice(0, 100);
   showRecord.value = true;
 }
+
+// TTS 播放: AI 回复自动发声
+// #ifdef H5
+async function playTts(text: string) {
+  try {
+    const blob = await speechApi.synthesize(text);
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.onended = () => URL.revokeObjectURL(url);
+    audio.onerror = () => URL.revokeObjectURL(url);
+    await audio.play(); // 需用户已交互 (按住录音即算), 否则浏览器拦截
+  } catch (e) {
+    console.warn("[chat] tts play failed", e);
+  }
+}
+// #endif
+// #ifndef H5
+function playTts(text: string) {
+  // 小程序/App: 待接 uni.createInnerAudioContext (需把 arraybuffer 存为临时文件)
+  console.warn("[chat] tts playback not implemented on this platform", text.slice(0, 20));
+}
+// #endif
 
 async function confirmRecord() {
   const text = recordText.value.trim();
@@ -446,6 +593,37 @@ function scrollToBottom() {
   font-size: 32rpx;
   flex-shrink: 0;
   box-shadow: 0 4rpx 12rpx rgba(74, 144, 217, 0.3);
+  transition: transform 0.15s;
+
+  &.recording {
+    background: linear-gradient(135deg, #e74c3c, #c0392b);
+    box-shadow: 0 4rpx 12rpx rgba(231, 76, 60, 0.4);
+    transform: scale(1.12);
+    animation: record-pulse 1s infinite;
+  }
+}
+
+@keyframes record-pulse {
+  0%, 100% { transform: scale(1.08); }
+  50% { transform: scale(1.18); }
+}
+
+.voice-tip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8rpx;
+  padding-top: 12rpx;
+  font-size: 24rpx;
+  color: #e74c3c;
+
+  .tip-dot {
+    width: 14rpx;
+    height: 14rpx;
+    border-radius: 50%;
+    background: #e74c3c;
+    animation: record-pulse 1s infinite;
+  }
 }
 
 .send-btn {
