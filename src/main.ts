@@ -1,15 +1,10 @@
-import { createSSRApp } from "vue";
+import { createApp } from "vue";
 import { createPinia } from "pinia";
 import App from "./App.vue";
+import router from "./router";
+import "vant/lib/index.css";
 
-export function createApp() {
-  const app = createSSRApp(App);
-  const pinia = createPinia();
-
-  app.use(pinia);
-
-  return {
-    app,
-    pinia,
-  };
-}
+const app = createApp(App);
+app.use(createPinia());
+app.use(router);
+app.mount("#app");

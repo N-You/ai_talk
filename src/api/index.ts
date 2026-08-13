@@ -1,77 +1,70 @@
-// API 基础配置（按平台区分：H5 走同源相对路径，由 nginx/vite 代理 /api 与 /ws；小程序用 127.0.0.1，真机调试改为电脑局域网 IP）
-// #ifdef H5
-const BASE_URL = "";
-const WS_URL = `${location.protocol === "https:" ? "wss://" : "ws://"}${location.host}`;
-// #endif
-// #ifdef MP-WEIXIN
-const BASE_URL = "http://127.0.0.1:8002";
-const WS_URL = "ws://127.0.0.1:8002";
-// #endif
-// #ifndef H5 || MP-WEIXIN
-const BASE_URL = "http://localhost:8002";
-const WS_URL = "ws://localhost:8002";
-// #endif
+import router from "@/router";
+import { showToast } from "vant";
 
-export { WS_URL };
+// API 基础配置（H5：走同源相对路径，由 vite/nginx 代理 /api 与 /ws 到后端）
+const BASE_URL = "";
+export const WS_URL = `${location.protocol === "https:" ? "wss://" : "ws://"}${location.host}`;
 
 interface RequestOptions {
   url: string;
   method?: "GET" | "POST" | "PUT" | "DELETE";
   data?: any;
-  header?: Record<string, string>;
 }
 
-// Token 管理
+// Token 管理（localStorage 持久化）
+const TOKEN_KEY = "token";
 let token: string | null = null;
 
 export function setToken(t: string) {
   token = t;
-  uni.setStorageSync("token", t);
+  localStorage.setItem(TOKEN_KEY, t);
 }
 
 export function getToken(): string {
-  if (!token) {
-    token = uni.getStorageSync("token") || null;
+  if (token === null) {
+    token = localStorage.getItem(TOKEN_KEY);
   }
   return token || "";
 }
 
-// 通用请求方法
+export function clearToken() {
+  token = null;
+  localStorage.removeItem(TOKEN_KEY);
+}
+
+// 通用请求方法（fetch 封装）
 async function request<T = any>(options: RequestOptions): Promise<T> {
   const { url, method = "GET", data } = options;
 
-  const header: Record<string, string> = {
+  const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
-
   const t = getToken();
-  if (t) {
-    header["Authorization"] = `Bearer ${t}`;
+  if (t) headers["Authorization"] = `Bearer ${t}`;
+
+  let resp: Response;
+  try {
+    resp = await fetch(`${BASE_URL}${url}`, {
+      method,
+      headers,
+      body: data !== undefined ? JSON.stringify(data) : undefined,
+    });
+  } catch {
+    showToast("网络异常，请检查连接");
+    throw new Error("network error");
   }
 
-  return new Promise((resolve, reject) => {
-    uni.request({
-      url: `${BASE_URL}${url}`,
-      method,
-      header,
-      data,
-      success: (res: any) => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve(res.data as T);
-        } else {
-          if (res.statusCode === 401) {
-            // 跳转登录
-            uni.reLaunch({ url: "/pages/index/index" });
-          }
-          reject(res.data);
-        }
-      },
-      fail: (err) => {
-        uni.showToast({ title: "网络异常", icon: "none" });
-        reject(err);
-      },
-    });
-  });
+  if (resp.status === 401) {
+    clearToken();
+    router.replace("/profile");
+    throw new Error("unauthorized");
+  }
+
+  const text = await resp.text();
+  const json = text ? JSON.parse(text) : null;
+
+  if (resp.status >= 200 && resp.status < 300) return json as T;
+  throw json ?? new Error(`HTTP ${resp.status}`);
 }
 
 // ── API 接口 ──────────────────────────────────
@@ -126,10 +119,12 @@ export const learningApi = {
   list: (params?: { page?: number; size?: number; type?: string; status?: string }) => {
     let qs = "";
     if (params) {
-      qs = "?" + Object.entries(params)
-        .filter(([_, v]) => v !== undefined)
-        .map(([k, v]) => `${k}=${v}`)
-        .join("&");
+      qs =
+        "?" +
+        Object.entries(params)
+          .filter(([_, v]) => v !== undefined)
+          .map(([k, v]) => `${k}=${v}`)
+          .join("&");
     }
     return request<any>({ url: `/api/learning-items${qs}` });
   },
@@ -147,10 +142,6 @@ export const learningApi = {
 };
 
 // 语音 (ASR: 录音文件 -> 文本)
-// 后端端点: POST /api/speech/transcribe (multipart, 字段名 file), JWT 鉴权
-// H5 用原生 fetch + FormData (uniapp alpha 版 H5 的 uploadFile+Blob 直传有丢内容 bug);
-// App/小程序用 uni.uploadFile (filePath)
-// #ifdef H5
 export const speechApi = {
   transcribe: async (
     input: { filePath?: string; file?: Blob | any; mimeType?: string },
@@ -160,11 +151,9 @@ export const speechApi = {
     const form = new FormData();
 
     if (input.file) {
-      const ext =
-        (input.mimeType ?? "audio/webm").split("/")[1]?.split(";")[0] || "webm";
+      const ext = (input.mimeType ?? "audio/webm").split("/")[1]?.split(";")[0] || "webm";
       form.append("file", input.file, `record_${Date.now()}.${ext}`);
     } else if (input.filePath) {
-      // blob: URL 或 data URL -> 转 Blob
       const blob = await fetch(input.filePath).then((r) => r.blob());
       form.append("file", blob, `record_${Date.now()}.${blob.type.split("/")[1] || "webm"}`);
     }
@@ -177,10 +166,13 @@ export const speechApi = {
     });
     const data = await resp.json().catch(() => ({}));
     if (resp.status >= 200 && resp.status < 300) return data;
-    if (resp.status === 401) uni.reLaunch({ url: "/pages/index/index" });
+    if (resp.status === 401) {
+      clearToken();
+      router.replace("/profile");
+    }
     throw data;
   },
-  // TTS: 文本 -> 音频 Blob (H5 用 Blob URL 播放)
+  // TTS: 文本 -> 音频 Blob
   synthesize: async (text: string, voice?: string): Promise<Blob> => {
     const t = getToken();
     const resp = await fetch(`${BASE_URL}/api/speech/tts`, {
@@ -191,80 +183,11 @@ export const speechApi = {
       },
       body: JSON.stringify({ text, voice }),
     });
-    if (resp.status === 401) uni.reLaunch({ url: "/pages/index/index" });
+    if (resp.status === 401) {
+      clearToken();
+      router.replace("/profile");
+    }
     if (!resp.ok) throw new Error("tts failed");
     return resp.blob();
   },
 };
-// #endif
-// #ifndef H5
-export const speechApi = {
-  transcribe: (
-    input: { filePath?: string; file?: Blob | any; mimeType?: string },
-    language?: string,
-  ) =>
-    new Promise<any>((resolve, reject) => {
-      const header: Record<string, string> = {};
-      const t = getToken();
-      if (t) header["Authorization"] = `Bearer ${t}`;
-
-      const options: any = {
-        url: `${BASE_URL}/api/speech/transcribe`,
-        name: "file",
-        header,
-        formData: language ? { language } : {},
-        success: (res: any) => {
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            try {
-              resolve(JSON.parse(res.data));
-            } catch {
-              resolve(res.data);
-            }
-          } else {
-            if (res.statusCode === 401) {
-              uni.reLaunch({ url: "/pages/index/index" });
-            }
-            try {
-              reject(JSON.parse(res.data));
-            } catch {
-              reject(res.data);
-            }
-          }
-        },
-        fail: (err) => reject(err),
-      };
-
-      if (input.filePath) {
-        options.filePath = input.filePath;
-      } else if (input.file) {
-        // 非 H5 无 Blob 直传, 理论不会走到; 保留防御
-        options.file = input.file;
-        options.fileType = "audio";
-      }
-      uni.uploadFile(options);
-    }),
-  // TTS: 文本 -> 音频 (小程序/App 用 arraybuffer, 后续接 uni.createInnerAudioContext)
-  synthesize: (text: string, voice?: string) =>
-    new Promise<any>((resolve, reject) => {
-      const header: Record<string, string> = { "Content-Type": "application/json" };
-      const t = getToken();
-      if (t) header["Authorization"] = `Bearer ${t}`;
-      uni.request({
-        url: `${BASE_URL}/api/speech/tts`,
-        method: "POST",
-        header,
-        data: { text, voice },
-        responseType: "arraybuffer",
-        success: (res: any) => {
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            resolve(res.data);
-          } else {
-            if (res.statusCode === 401) uni.reLaunch({ url: "/pages/index/index" });
-            reject(res.data);
-          }
-        },
-        fail: reject,
-      });
-    }),
-};
-// #endif

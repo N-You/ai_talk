@@ -1,74 +1,47 @@
+<template>
+  <div class="app-shell">
+    <router-view v-slot="{ Component }">
+      <keep-alive v-if="$route.meta.tab">
+        <component :is="Component" />
+      </keep-alive>
+      <component v-else :is="Component" />
+    </router-view>
+
+    <!-- 底部 TabBar（仅 tab 页显示） -->
+    <van-tabbar
+      v-if="$route.meta.tab"
+      route
+      active-color="#4A90D9"
+      inactive-color="#999999"
+      class="app-tabbar"
+    >
+      <van-tabbar-item replace to="/home" icon="wap-home-o">首页</van-tabbar-item>
+      <van-tabbar-item replace to="/scenarios" icon="chat-o">场景</van-tabbar-item>
+      <van-tabbar-item replace to="/learning" icon="bookmark-o">学习库</van-tabbar-item>
+      <van-tabbar-item replace to="/profile" icon="user-o">我的</van-tabbar-item>
+    </van-tabbar>
+  </div>
+</template>
+
 <script setup lang="ts">
-import { onLaunch, onShow, onHide } from "@dcloudio/uni-app";
-
-onLaunch(() => {
-  console.log("AI English Tutor - App Launch");
-});
-
-onShow(() => {
-  console.log("App Show");
-});
-
-onHide(() => {
-  console.log("App Hide");
-});
+// 根组件：路由出口 + 底部导航
 </script>
 
 <style lang="scss">
-/* 全局样式 */
-page {
+html, body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-  font-size: 28rpx;
-  color: #333333;
-  background-color: #f5f5f5;
-  line-height: 1.6;
+  font-size: 14px;
+  color: #333;
+  background-color: #f5f6fa;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* 主题色 */
-$primary: #4a90d9;
-$primary-light: #e8f0fe;
-$success: #52c41a;
-$warning: #faad14;
-$danger: #ff4d4f;
-$text-primary: #333333;
-$text-secondary: #666666;
-$text-hint: #999999;
-$border-color: #e8e8e8;
-$bg-white: #ffffff;
-$bg-page: #f5f5f5;
-
-/* 通用组件样式 */
-.card {
-  background: $bg-white;
-  border-radius: 16rpx;
-  padding: 24rpx;
-  margin: 16rpx 24rpx;
-  box-shadow: 0 2rpx 12rpx rgba(0, 0, 0, 0.04);
+.app-shell {
+  height: 100%;
 }
 
-.btn-primary {
-  background: linear-gradient(135deg, #4a90d9, #357abd);
-  color: #ffffff;
-  border: none;
-  border-radius: 12rpx;
-  padding: 20rpx 48rpx;
-  font-size: 32rpx;
-  font-weight: 500;
-  text-align: center;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.3s;
-}
-
-.btn-primary:active {
-  opacity: 0.85;
-  transform: scale(0.98);
-}
-
-.safe-bottom {
-  padding-bottom: constant(safe-area-inset-bottom);
-  padding-bottom: env(safe-area-inset-bottom);
+.app-tabbar {
+  z-index: 999;
 }
 </style>
