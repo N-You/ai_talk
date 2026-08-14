@@ -15,6 +15,10 @@ export default defineConfig({
       "@": fileURLToPath(new URL("./src", import.meta.url)),
     },
   },
+  build: {
+    // 图标 SVG 保持为独立文件输出，不内联为 data URL
+    assetsInlineLimit: 0,
+  },
   server: {
     port: 3000,
     proxy: {

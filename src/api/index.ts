@@ -1,8 +1,16 @@
 import router from "@/router";
 import { showToast } from "vant";
 
+/**
+ * 请求层统一出口：所有后端 API 的封装。
+ * - H5 走同源相对路径，由 vite/nginx 代理 /api 与 /ws 到后端
+ * - token 内存 + localStorage 双层管理，401 全局登出
+ * - 按领域分组成语义化 API 对象，页面只依赖这里，不直接 fetch
+ */
+
 // API 基础配置（H5：走同源相对路径，由 vite/nginx 代理 /api 与 /ws 到后端）
 const BASE_URL = "";
+/** WebSocket 地址：随页面协议自动切换 ws/wss */
 export const WS_URL = `${location.protocol === "https:" ? "wss://" : "ws://"}${location.host}`;
 
 interface RequestOptions {
@@ -15,11 +23,13 @@ interface RequestOptions {
 const TOKEN_KEY = "token";
 let token: string | null = null;
 
+/** 保存 token（写内存 + localStorage，刷新不丢登录态） */
 export function setToken(t: string) {
   token = t;
   localStorage.setItem(TOKEN_KEY, t);
 }
 
+/** 读取 token：内存未命中时从 localStorage 惰性加载 */
 export function getToken(): string {
   if (token === null) {
     token = localStorage.getItem(TOKEN_KEY);
@@ -27,12 +37,19 @@ export function getToken(): string {
   return token || "";
 }
 
+/** 清除 token（登出/401 时调用） */
 export function clearToken() {
   token = null;
   localStorage.removeItem(TOKEN_KEY);
 }
 
-// 通用请求方法（fetch 封装）
+/**
+ * 通用请求方法（fetch 封装）：
+ * 1. 自动注入 Authorization: Bearer token
+ * 2. 网络异常统一 toast
+ * 3. 401 全局处理：清 token 跳 /profile（一次实现全局登出）
+ * 4. 统一 JSON 解析；非 2xx 抛响应体
+ */
 async function request<T = any>(options: RequestOptions): Promise<T> {
   const { url, method = "GET", data } = options;
 
@@ -112,6 +129,9 @@ export const conversationApi = {
   detail: (id: number) => request<any>({ url: `/api/conversations/${id}` }),
   end: (id: number, data: any) =>
     request<any>({ url: `/api/conversations/${id}/end`, method: "PUT", data }),
+  /** 单词释义查询（对话中点击单词弹窗）：返回 { word, phonetic, meaning, example } */
+  explainWord: (word: string) =>
+    request<any>({ url: "/api/conversations/explain-word", method: "POST", data: { word } }),
 };
 
 // 学习库
@@ -170,7 +190,7 @@ export const speechApi = {
       clearToken();
       router.replace("/profile");
     }
-    throw data;
+    throw new Error(data?.message || "语音识别失败");
   },
   // TTS: 文本 -> 音频 Blob
   synthesize: async (text: string, voice?: string): Promise<Blob> => {
@@ -187,7 +207,10 @@ export const speechApi = {
       clearToken();
       router.replace("/profile");
     }
-    if (!resp.ok) throw new Error("tts failed");
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => null);
+      throw new Error(data?.message || "语音朗读失败");
+    }
     return resp.blob();
   },
 };
