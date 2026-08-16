@@ -219,11 +219,15 @@ const liveStatusText = computed(() => {
   return "已暂停聆听";
 });
 
-// VAD 分段录音器：停顿自动切段 → 转写 → 自动发送
+// VAD 分段录音器：停顿自动切段 → 转写 → 自动发送。
+// 参数经调优（详见 docs/音频识别优化方案.md）：
+// - 显式开启回声消除/降噪/自动增益（useVoiceDetector 内 getUserMedia 约束）
+// - 触发阈值自适应噪声地板（triggerRatio=4），环境音不再误触发
+// - 预卷 400ms + 句尾取尾补齐，解决句首/句尾被切（接收不全）
 const voiceDetector = useVoiceDetector({
   minSpeechMs: 500, // <0.5s 视为噪音
-  maxSpeechMs: 20000, // 单句最长 20s
-  silenceMs: 1200, // 静音 1.2s 判定一句结束
+  maxSpeechMs: 15000, // 单句最长 15s（受 DashScope base64 10MB 上限约束）
+  silenceMs: 1200, // 静音 1.2s 判定一句结束（英文学习者思考停顿多，0.9s 会把句子切碎）
   onSegment: (blob, mimeType) => handleLiveSegment(blob, mimeType),
 });
 
@@ -244,12 +248,19 @@ function toggleMode(m: "live" | "qa") {
 /** 开始实时聆听（需用户手势触发麦克风权限） */
 async function startLive() {
   if (liveStarted.value || isThinking.value) return;
-  const ok = await voiceDetector.start();
-  if (!ok) {
-    showToast("无法访问麦克风，请检查权限");
-    return;
+  try {
+    const ok = await voiceDetector.start();
+    if (!ok) {
+      // start() 返回 false：麦克风权限被拒 / AudioContext 无法启动
+      showToast("无法访问麦克风，请检查权限");
+      return;
+    }
+    liveStarted.value = true;
+  } catch (e: any) {
+    // start() 内部异常（如 AudioContext 创建失败）也要兜住，避免页面卡死
+    console.error("[chat] startLive error", e);
+    showToast("启动聆听失败，请重试");
   }
-  liveStarted.value = true;
 }
 
 /** 停止实时聆听 */
@@ -261,16 +272,29 @@ function stopLive() {
 
 /** VAD 切段回调：转写该段并自动发送（无感闭环） */
 async function handleLiveSegment(blob: Blob, mimeType: string) {
-  if (liveTranscribing.value || isThinking.value || !liveStarted.value) return;
+  // 丢弃原因都打日志，方便排查"收不到语音"：
+  // - liveTranscribing=true：上一段还在转写中（含 60s 超时+重试，最长达分钟级），当前段被挤掉
+  // - isThinking=true：AI 回复中（正常），但若回复状态卡死也会静默丢段
+  // - !liveStarted：聆听已停止（正常）
+  if (liveTranscribing.value) {
+    console.debug("[chat] live 段被丢弃：上一段仍在转写中");
+    return;
+  }
+  if (isThinking.value) {
+    console.debug("[chat] live 段被丢弃：AI 正在回复中 (isThinking=true)");
+    return;
+  }
+  if (!liveStarted.value) return;
   liveTranscribing.value = true;
+  console.debug(`[chat] live 段转写开始 blob=${blob.size}B mime=${mimeType}`);
   try {
     const res = await speechApi.transcribe({ file: blob, mimeType });
     const text = (res?.text ?? "").trim();
     if (!text) return; // 空识别直接忽略，继续聆听
     if (isThinking.value) return; // AI 正在回复，丢弃本次输入
-    // 无感发送：不进输入框，直接走 WS
+    // 无感发送：不进输入框，直接走 WS。
+    // 注意：未连接判断必须在 push 之前，旧代码在这里 pop() 会误删上一条 AI 消息。
     if (!connected.value || !socket.value) {
-      messages.value.pop(); // 未连接，撤销本地假消息
       showToast("连接已断开，请重试");
       return;
     }
@@ -291,13 +315,31 @@ async function handleLiveSegment(blob: Blob, mimeType: string) {
   }
 }
 
-/** AI 回复完成后恢复聆听（live 模式）；若 TTS 在播则等播完，防回声录入 */
+/**
+ * AI 回复完成后恢复聆听（live 模式）；若 TTS 在播则等播完，防回声录入。
+ * 超时兜底（2026-08-16 二次修复）：**不再停掉 TTS**（用户反馈长文本朗读被 8s 截断），
+ * 改为把 TTS 音量降到 0.25 后恢复聆听 —— TTS 完整播完，回声被压到很弱；
+ * 若用户此时说话，微弱回声对 ASR 影响小。TTS 播完(ended) 后音量由下次 playTts 重置。
+ */
 function resumeLiveAfterReply() {
   if (mode.value !== "live" || !liveStarted.value) return;
+  const resumeNow = () => voiceDetector.resume();
   if (audioEl && !audioEl.paused && !audioEl.ended) {
-    audioEl.addEventListener("ended", () => voiceDetector.resume(), { once: true });
+    const timer = setTimeout(() => {
+      // 超时兜底：不截断 TTS，只降音量 + 恢复聆听（防 play() 卡死导致永不恢复）
+      audioEl!.volume = 0.25;
+      resumeNow();
+    }, 8000);
+    audioEl.addEventListener(
+      "ended",
+      () => {
+        clearTimeout(timer);
+        resumeNow();
+      },
+      { once: true },
+    );
   } else {
-    setTimeout(() => voiceDetector.resume(), 700);
+    setTimeout(resumeNow, 700);
   }
 }
 
@@ -371,11 +413,22 @@ function connectSocket() {
 
   ws.onclose = () => {
     connected.value = false;
+    // 关键修复（2026-08-16）：连接断开时复位 AI 回复状态。
+    // 否则 isThinking 卡 true → handleLiveSegment 守卫 `if (isThinking.value) return`
+    // 会静默丢弃所有后续语音段 → "实时对话收不到语音"。
+    isThinking.value = false;
+    streaming.value = false;
+    liveTranscribing.value = false;
+    if (mode.value === "live" && liveStarted.value) voiceDetector.resume();
   };
 
   ws.onerror = (e) => {
     console.error("[chat] socket error", e);
     connected.value = false;
+    // 与 onclose 同样复位，防止状态卡死
+    isThinking.value = false;
+    streaming.value = false;
+    liveTranscribing.value = false;
   };
 
   socket.value = ws;
@@ -475,7 +528,35 @@ let h5Chunks: BlobPart[] = [];
 let h5Stream: MediaStream | null = null;
 
 /**
- * 开始录音：getUserMedia 取流 → MediaRecorder 采集（webm/mp4 兼容）；
+ * 一问一答模式的麦克风约束（与实时聆听保持一致）：
+ * 显式开启回声消除/降噪/自动增益，单声道采集。
+ * 用 { ideal } 而非 { exact }，部分设备不支持强制约束时自动降级，不报错。
+ * noiseSuppression 对英文高频辅音有削弱风险，可改 false 做 A/B 对比
+ * （见 useVoiceDetector.ts 顶部注释）。
+ */
+const QA_AUDIO_CONSTRAINTS: MediaTrackConstraints = {
+  echoCancellation: { ideal: true },
+  noiseSuppression: { ideal: true },
+  autoGainControl: { ideal: true },
+  channelCount: { ideal: 1 },
+};
+
+/** 录音码率：opus 128kbps 保留英文高频辅音细节（与 useVoiceDetector 一致） */
+const QA_RECORD_BITS_PER_SECOND = 128_000;
+
+/** 录音 MIME 候选（与 useVoiceDetector 一致）：opus 优先，webm/mp4 兜底 */
+const QA_MIME_CANDIDATES = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+
+/** 挑第一个浏览器支持的录音编码；全不支持返回空串让浏览器自选 */
+function pickQaMime(): string {
+  for (const m of QA_MIME_CANDIDATES) {
+    if (MediaRecorder.isTypeSupported(m)) return m;
+  }
+  return "";
+}
+
+/**
+ * 开始录音：getUserMedia（带回声消除/降噪约束）→ MediaRecorder 采集；
  * 停止后组装 Blob 交给 doTranscribe。
  */
 function startRecord() {
@@ -484,15 +565,33 @@ function startRecord() {
     showToast("请先登录");
     return;
   }
+  // 防回声（2026-08-16）：用户按住说话 = 明确抢话意图，
+  // 先暂停正在播放的 TTS，否则外放声音被录进录音 → 识别混乱
+  if (audioEl && !audioEl.paused && !audioEl.ended) {
+    audioEl.pause();
+  }
   navigator.mediaDevices
-    .getUserMedia({ audio: true })
+    .getUserMedia({ audio: QA_AUDIO_CONSTRAINTS })
     .then((stream) => {
       h5Stream = stream;
       h5Chunks = [];
-      const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
-      h5Recorder = new MediaRecorder(stream, { mimeType: mime });
+      const mime = pickQaMime();
+      try {
+        h5Recorder = new MediaRecorder(
+          stream,
+          mime
+            ? { mimeType: mime, audioBitsPerSecond: QA_RECORD_BITS_PER_SECOND }
+            : { audioBitsPerSecond: QA_RECORD_BITS_PER_SECOND },
+        );
+      } catch {
+        h5Recorder = new MediaRecorder(stream); // 兜底自选编码
+      }
       h5Recorder.ondataavailable = (e) => {
         if (e.data.size > 0) h5Chunks.push(e.data);
+      };
+      h5Recorder.onerror = (e) => {
+        console.error("[chat] recorder error", e);
+        showToast("录音异常，请重试");
       };
       h5Recorder.onstop = () => {
         h5Stream?.getTracks().forEach((t) => t.stop());
@@ -500,6 +599,11 @@ function startRecord() {
         recording.value = false;
         const blob = new Blob(h5Chunks, { type: mime });
         h5Chunks = [];
+        // 太短（< ~0.3s 音频）视为误触/噪音，直接丢弃，避免空识别
+        if (blob.size < 8 * 1024) {
+          showToast("录音太短，请再说一次");
+          return;
+        }
         if (blob.size > 0) doTranscribe({ file: blob, mimeType: mime });
       };
       h5Recorder.start();
@@ -590,19 +694,32 @@ function releaseAudio() {
   }
 }
 
+/**
+ * 播放 TTS（自动朗读 / 手动点 🔊）。
+ * 防回声关键（2026-08-16）：播放前若 live 模式在聆听，先暂停 VAD/录音——
+ * 否则外放 TTS 会被麦克风录进下一段，ASR 把 TTS 内容与用户声音混在一起识别，
+ * 出现"词义丢失/错误识别"。播放结束/失败后由 resumeLiveAfterReply 恢复聆听。
+ */
 async function playTts(text: string) {
   if (!text) return;
   if (text.length > MAX_AUTO_TTS_LEN) return;
+  // 播放前：live 模式先暂停聆听（TTS 播完再恢复），防回声入麦
+  if (mode.value === "live" && liveStarted.value) voiceDetector.pause();
   try {
     const blob = await speechApi.synthesize(text);
     releaseAudio();
     audioUrl = URL.createObjectURL(blob);
     if (!audioEl) audioEl = new Audio();
     audioEl.src = audioUrl;
+    audioEl.volume = 0.7; // 轻微降低外放音量，减小回声能量（不影响听感）
     audioEl.play().catch(() => {});
+    // 播完/超时后恢复聆听（8s 超时兜底为"降音量 0.25 + 恢复"，不截断 TTS，见 resumeLiveAfterReply）
+    resumeLiveAfterReply();
   } catch (e: any) {
     console.error("[chat] tts error", e);
     showToast(e?.message || "语音朗读失败");
+    // 合成失败：没有 TTS 播放，恢复聆听
+    resumeLiveAfterReply();
   }
 }
 

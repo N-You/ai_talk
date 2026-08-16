@@ -1,7 +1,7 @@
 # 依赖
 node_modules/
 dist/
-dist-verify/
+unpackage/
 
 # 环境
 .env

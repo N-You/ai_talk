@@ -1,5 +1,6 @@
 import router from "@/router";
 import { showToast } from "vant";
+import { transcribeAudio, UploadError } from "@/utils/chunkedUpload";
 
 /**
  * 请求层统一出口：所有后端 API 的封装。
@@ -163,34 +164,37 @@ export const learningApi = {
 
 // 语音 (ASR: 录音文件 -> 文本)
 export const speechApi = {
+  /**
+   * 语音转写：底层走 chunkedUpload 增强层（超时 + 指数退避重试 + 大文件分片）。
+   * language 为可选语言提示；不确定或中英混合时不要传，让模型自动检测更准。
+   */
   transcribe: async (
     input: { filePath?: string; file?: Blob | any; mimeType?: string },
     language?: string,
   ) => {
     const t = getToken();
-    const form = new FormData();
+    let file: Blob;
+    let mimeType = input.mimeType ?? "audio/webm";
 
     if (input.file) {
-      const ext = (input.mimeType ?? "audio/webm").split("/")[1]?.split(";")[0] || "webm";
-      form.append("file", input.file, `record_${Date.now()}.${ext}`);
+      file = input.file;
     } else if (input.filePath) {
-      const blob = await fetch(input.filePath).then((r) => r.blob());
-      form.append("file", blob, `record_${Date.now()}.${blob.type.split("/")[1] || "webm"}`);
+      file = await fetch(input.filePath).then((r) => r.blob());
+      mimeType = file.type || mimeType;
+    } else {
+      throw new Error("缺少音频文件");
     }
-    if (language) form.append("language", language);
 
-    const resp = await fetch(`${BASE_URL}/api/speech/transcribe`, {
-      method: "POST",
-      headers: t ? { Authorization: `Bearer ${t}` } : {},
-      body: form,
-    });
-    const data = await resp.json().catch(() => ({}));
-    if (resp.status >= 200 && resp.status < 300) return data;
-    if (resp.status === 401) {
-      clearToken();
-      router.replace("/profile");
+    try {
+      return await transcribeAudio(file, mimeType, { language, token: t });
+    } catch (e: any) {
+      // 401 走统一登出逻辑；其余错误向上抛给调用方 toast
+      if (e instanceof UploadError && e.status === 401) {
+        clearToken();
+        router.replace("/profile");
+      }
+      throw e;
     }
-    throw new Error(data?.message || "语音识别失败");
   },
   // TTS: 文本 -> 音频 Blob
   synthesize: async (text: string, voice?: string): Promise<Blob> => {
