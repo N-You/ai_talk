@@ -82,7 +82,6 @@
 import { ref, onMounted, onActivated } from "vue";
 import { useRouter } from "vue-router";
 import gsap from "gsap";
-import { getToken } from "@/api";
 import iconMascot from "@/assets/icons/mascot.svg";
 import iconPlay from "@/assets/icons/play-cartoon.svg";
 import iconCoffee from "@/assets/icons/icon-coffee.svg";
@@ -94,7 +93,12 @@ const masteredWords = ref(128);
 const minutes = ref(45);
 const todoWords = ref(12);
 
-const featuredScenes = ref([
+interface Scene {
+  id: number;
+  name: string;
+}
+
+const featuredScenes = ref<Scene[]>([
   { id: 1, name: "咖啡店点单" },
   { id: 4, name: "机场值机" },
   { id: 7, name: "求职面试" },
@@ -173,7 +177,7 @@ function goLearning() {
 }
 
 /** 导航：进入对话页，场景信息通过 query 传递（聊天页头部直接展示场景名） */
-function goChat(scene: any) {
+function goChat(scene: Scene) {
   router.push({ path: "/chat", query: { scenarioId: scene.id, scenarioName: scene.name } });
 }
 </script>

@@ -102,13 +102,6 @@ const categories = [
   { key: "travel", label: "旅行" },
 ];
 
-const catLabelMap: Record<string, string> = {
-  life: "日常生活",
-  work: "职场",
-  travel: "旅行",
-  programmer: "程序员",
-};
-
 const activeCategory = ref("all");
 const scenarios = ref<Scenario[]>([]);
 const loading = ref(true);

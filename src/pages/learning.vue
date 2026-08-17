@@ -5,7 +5,7 @@
     <!-- 顶部栏 -->
     <header class="page-header">
       <span class="page-title">我的生词本</span>
-      <div class="icon-btn" @click="onSearchFocus">
+      <div class="icon-btn">
         <svg width="18" height="18" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg">
           <path d="M3 4.5H15L10.5 10V14L7.5 15V10L3 4.5Z" stroke="#0DBA9C" stroke-width="2" stroke-linejoin="round"/>
         </svg>
@@ -230,13 +230,6 @@ const levels = [
   { key: 4, code: "L4", name: "精通" },
 ];
 
-const typeLabelMap: Record<string, string> = {
-  WORD: "单词",
-  PHRASE: "短语",
-  SENTENCE: "句子",
-  EXPRESSION: "表达",
-};
-
 const reviewOptions = [
   { key: "again", label: "忘记", type: "danger" },
   { key: "hard", label: "模糊", type: "warning" },
@@ -336,10 +329,6 @@ function onSearch() {
     items.value = [];
     fetchItems();
   }, 400);
-}
-
-function onSearchFocus() {
-  /* 预留：聚焦搜索 */
 }
 
 /** 切换状态 tab：重置分页并重新拉取 */

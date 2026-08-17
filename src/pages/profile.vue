@@ -111,7 +111,7 @@
           <span class="setting-label">AI 语速</span>
           <span class="setting-value">正常 1.0x</span>
         </div>
-        <van-slider v-model="speed" :min="0.5" :max="1.5" :step="0.1" :bar-height="4" active-color="#0DBA9C" @change="onSpeedChange" />
+        <van-slider v-model="speed" :min="0.5" :max="1.5" :step="0.1" :bar-height="4" active-color="#0DBA9C" />
       </div>
 
       <!-- 口音偏好 -->
@@ -134,7 +134,7 @@
           <span class="setting-label">对话风格 (Temperature)</span>
           <span class="setting-value">{{ temperature }} · {{ temperatureLabel }}</span>
         </div>
-        <van-slider v-model="temperature" :min="0" :max="1.5" :step="0.1" :bar-height="4" active-color="#0DBA9C" @change="onTempChange" />
+        <van-slider v-model="temperature" :min="0" :max="1.5" :step="0.1" :bar-height="4" active-color="#0DBA9C" />
       </div>
 
       <!-- 高级配置入口 -->
@@ -391,14 +391,6 @@ function doLogout() {
 /** 占位：未实现功能统一提示"开发中" */
 function noImplement() {
   showToast("开发中");
-}
-
-function onSpeedChange(v: number | number[]) {
-  // 保留：同步到后端设置
-}
-
-function onTempChange(v: number | number[]) {
-  // 保留：同步到后端设置
 }
 
 /** 点击循环切换口音偏好（美式→英式→澳式） */

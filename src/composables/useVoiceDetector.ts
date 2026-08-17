@@ -1,4 +1,5 @@
 import { ref } from "vue";
+import { showToast } from "vant";
 
 /**
  * 语音活动检测（VAD）+ 静音分段录音工具 —— 音频优化版（2026-08）。
@@ -105,6 +106,9 @@ const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   autoGainControl: { ideal: true }, // 自动增益：人离麦远近音量趋于一致
   channelCount: { ideal: 1 }, // 单声道：文件减半，ASR 无需立体声
 };
+
+/** 约束降级提示只弹一次（避免每次聆听都打扰） */
+let constraintWarned = false;
 
 /**
  * 录音码率（bps）：opus 默认 ~32kbps 会丢失英文高频辅音细节。
@@ -348,6 +352,20 @@ export function useVoiceDetector(options: VoiceDetectorOptions = {}) {
     } catch (err) {
       console.error("[useVoiceDetector] getUserMedia failed", err);
       return false;
+    }
+
+    // 约束生效自检（2026-08-17）：{ ideal } 是"尽力而为"，部分设备/浏览器会静默降级——
+    // 读实际值确认回声消除是否真生效，否则"以为有 AEC 其实没有"是回声盲区。
+    // 只提示一次，避免每次聆听都打扰。
+    const track = stream.getAudioTracks()[0];
+    const settings = track?.getSettings?.();
+    if (settings && settings.echoCancellation === false && !constraintWarned) {
+      constraintWarned = true;
+      console.warn("[useVoiceDetector] echoCancellation 未生效（设备/浏览器降级），建议佩戴耳机");
+      showToast("当前设备回声消除未生效，建议佩戴耳机");
+    }
+    if (settings && settings.noiseSuppression === false) {
+      console.warn("[useVoiceDetector] noiseSuppression 未生效，环境噪声将进入识别");
     }
 
     currentMime = pickMimeType();

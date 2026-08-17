@@ -196,25 +196,32 @@ export const speechApi = {
       throw e;
     }
   },
-  // TTS: 文本 -> 音频 Blob
+  // TTS: 文本 -> 音频 Blob（30s 超时：防上游挂起让"播放/聆听恢复"永久等待，与 chunkedUpload 对齐）
   synthesize: async (text: string, voice?: string): Promise<Blob> => {
     const t = getToken();
-    const resp = await fetch(`${BASE_URL}/api/speech/tts`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(t ? { Authorization: `Bearer ${t}` } : {}),
-      },
-      body: JSON.stringify({ text, voice }),
-    });
-    if (resp.status === 401) {
-      clearToken();
-      router.replace("/profile");
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 30_000);
+    try {
+      const resp = await fetch(`${BASE_URL}/api/speech/tts`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(t ? { Authorization: `Bearer ${t}` } : {}),
+        },
+        body: JSON.stringify({ text, voice }),
+        signal: ctrl.signal,
+      });
+      if (resp.status === 401) {
+        clearToken();
+        router.replace("/profile");
+      }
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => null);
+        throw new Error(data?.message || "语音朗读失败");
+      }
+      return resp.blob();
+    } finally {
+      clearTimeout(timer);
     }
-    if (!resp.ok) {
-      const data = await resp.json().catch(() => null);
-      throw new Error(data?.message || "语音朗读失败");
-    }
-    return resp.blob();
   },
 };

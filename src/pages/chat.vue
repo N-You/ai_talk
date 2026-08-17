@@ -13,9 +13,9 @@
       </div>
         <div class="header-info">
           <div class="header-title">{{ scenarioName }}</div>
-          <div class="header-status" :class="{ online: connected }">
+          <div class="header-status" :class="{ online: connected, reconnecting: reconnecting }">
             <span class="status-dot"></span>
-            {{ connected ? "AI 老师在线" : "连接中..." }}
+            {{ connected ? "AI 老师在线" : (reconnecting ? "连接断开，重连中..." : "连接中...") }}
           </div>
         </div>
       </div>
@@ -192,6 +192,14 @@ const isThinking = ref(false);
 const listRef = ref<HTMLDivElement | null>(null);
 const socket = ref<WebSocket | null>(null);
 const connected = ref(false);
+const reconnecting = ref(false);
+// 自动重连状态（指数退避）
+let reconnectTimer: number | null = null;
+let reconnectAttempts = 0;
+// 心跳检测（应用层 ping + 假死兜底）
+let heartbeatTimer: number | null = null;
+let staleCheckTimer: number | null = null;
+let lastMsgAt = 0;
 
 // 单词释义弹窗状态（点击消息中的单词触发）
 const showWordModal = ref(false);
@@ -321,25 +329,39 @@ async function handleLiveSegment(blob: Blob, mimeType: string) {
  * 改为把 TTS 音量降到 0.25 后恢复聆听 —— TTS 完整播完，回声被压到很弱；
  * 若用户此时说话，微弱回声对 ASR 影响小。TTS 播完(ended) 后音量由下次 playTts 重置。
  */
+/**
+ * AI 回复播完后恢复聆听（防回声关键）：
+ * - 优先监听播放进度 timeupdate：剩余 <0.6s 即恢复——长句尾部不再被 8s 定时器"一刀切"，
+ *   既不把 TTS 尾部录进下一段，也不让用户等 TTS 完全播完才开口
+ * - 兜底：8s 超时降音量 0.25 后恢复（timeupdate 不触发 / 播放卡死时保底，不截断 TTS）
+ */
 function resumeLiveAfterReply() {
   if (mode.value !== "live" || !liveStarted.value) return;
-  const resumeNow = () => voiceDetector.resume();
+  const resumeNow = () => {
+    if (ttsTailTimer !== null) {
+      clearTimeout(ttsTailTimer);
+      ttsTailTimer = null;
+    }
+    audioEl?.removeEventListener("timeupdate", onTime);
+    audioEl?.removeEventListener("ended", onEnded);
+    voiceDetector.resume();
+  };
+  function onTime() {
+    if (audioEl && audioEl.duration > 0 && audioEl.duration - audioEl.currentTime < 0.6) resumeNow();
+  }
+  function onEnded() {
+    resumeNow();
+  }
   if (audioEl && !audioEl.paused && !audioEl.ended) {
-    const timer = setTimeout(() => {
+    audioEl.addEventListener("timeupdate", onTime);
+    audioEl.addEventListener("ended", onEnded, { once: true });
+    ttsTailTimer = window.setTimeout(() => {
       // 超时兜底：不截断 TTS，只降音量 + 恢复聆听（防 play() 卡死导致永不恢复）
-      audioEl!.volume = 0.25;
+      if (audioEl && !audioEl.paused && !audioEl.ended) audioEl.volume = 0.25;
       resumeNow();
     }, 8000);
-    audioEl.addEventListener(
-      "ended",
-      () => {
-        clearTimeout(timer);
-        resumeNow();
-      },
-      { once: true },
-    );
   } else {
-    setTimeout(resumeNow, 700);
+    window.setTimeout(resumeNow, 700);
   }
 }
 
@@ -365,13 +387,12 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
-  socket.value?.close();
-  socket.value = null;
+  cleanupSocket();
   voiceDetector.stop();
   releaseAudio();
 });
 
-/** 初始化会话：创建会话记录 → 拿到 conversation_id → 连接 WebSocket */
+/** 初始化会话：创建会话记录 → 拿到 conversation_id → 建立 WebSocket 连接 */
 async function initConversation() {
   try {
     const conv = await conversationApi.create(scenarioId.value);
@@ -383,9 +404,11 @@ async function initConversation() {
 }
 
 /**
- * 建立 WebSocket 连接（/ws/conversations?token=...）：
- * onopen → 发送 join；onmessage → 分发 handleWSMessage；
- * onclose/onerror → 更新连接状态（UI 显示"连接中..."）。
+ * 建立原生 WebSocket 连接（/ws/conversations?token=...），带完整连接健壮性：
+ * - 自动重连：断线后指数退避（1s 起、封顶 30s、加抖动），成功后自动重新 join 恢复会话
+ * - 心跳检测：25s 发应用层 ping（服务端回 pong）；60s 内收不到任何消息判定假死，主动断开触发重连
+ *   （服务端另有协议级 ping/pong 心跳，30s 内无响应会被服务端 terminate）
+ * - onopen → join；onmessage → 分发 handleWSMessage
  */
 function connectSocket() {
   const token = getToken();
@@ -395,24 +418,42 @@ function connectSocket() {
     return;
   }
 
+  // 防止重复连接：旧连接先摘除 onclose 并关闭（不触发重连）
+  if (socket.value) {
+    socket.value.onclose = null;
+    socket.value.close();
+  }
+
   const url = `${WS_URL}/ws/conversations?token=${encodeURIComponent(token)}`;
   const ws = new WebSocket(url);
+  socket.value = ws;
+  lastMsgAt = Date.now();
 
   ws.onopen = () => {
     connected.value = true;
+    reconnecting.value = false;
+    reconnectAttempts = 0; // 连接成功，重置退避步数
     ws.send(JSON.stringify({ event: "join", data: { conversation_id: conversationId.value } }));
+    startHeartbeat();
   };
 
   ws.onmessage = (e) => {
+    lastMsgAt = Date.now(); // 任何消息都算"连接存活"
+    let payload: any;
     try {
-      handleWSMessage(JSON.parse(e.data));
+      payload = JSON.parse(e.data);
     } catch (err) {
       console.error("[chat] bad message", err, e.data);
+      return;
     }
+    // 应用层 pong 仅用于假死兜底，无需分发 UI
+    if (payload.event === "pong") return;
+    handleWSMessage(payload);
   };
 
   ws.onclose = () => {
     connected.value = false;
+    stopHeartbeat();
     // 关键修复（2026-08-16）：连接断开时复位 AI 回复状态。
     // 否则 isThinking 卡 true → handleLiveSegment 守卫 `if (isThinking.value) return`
     // 会静默丢弃所有后续语音段 → "实时对话收不到语音"。
@@ -420,18 +461,73 @@ function connectSocket() {
     streaming.value = false;
     liveTranscribing.value = false;
     if (mode.value === "live" && liveStarted.value) voiceDetector.resume();
+    scheduleReconnect();
   };
 
   ws.onerror = (e) => {
+    // onerror 后必然触发 onclose（由 onclose 统一处理复位 + 重连）
     console.error("[chat] socket error", e);
-    connected.value = false;
-    // 与 onclose 同样复位，防止状态卡死
-    isThinking.value = false;
-    streaming.value = false;
-    liveTranscribing.value = false;
   };
+}
 
-  socket.value = ws;
+/** 启动应用层心跳：定时 ping + 假死检测 */
+function startHeartbeat() {
+  stopHeartbeat();
+  const PING_INTERVAL_MS = 25_000;
+  const STALE_TIMEOUT_MS = 60_000;
+  heartbeatTimer = window.setInterval(() => {
+    if (socket.value && socket.value.readyState === WebSocket.OPEN) {
+      socket.value.send(JSON.stringify({ event: "ping" }));
+    }
+  }, PING_INTERVAL_MS);
+  staleCheckTimer = window.setInterval(() => {
+    if (socket.value && socket.value.readyState === WebSocket.OPEN && Date.now() - lastMsgAt > STALE_TIMEOUT_MS) {
+      console.warn("[chat] heartbeat stale, force reconnect");
+      socket.value.close(); // 触发 onclose → scheduleReconnect
+    }
+  }, 5_000);
+}
+
+/** 停止心跳定时器（连接断开/页面卸载时） */
+function stopHeartbeat() {
+  if (heartbeatTimer !== null) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+  if (staleCheckTimer !== null) {
+    clearInterval(staleCheckTimer);
+    staleCheckTimer = null;
+  }
+}
+
+/** 指数退避自动重连：1s×2^n 封顶 30s，加 ±30% 抖动避免并发踩踏 */
+function scheduleReconnect() {
+  if (reconnectTimer !== null) return; // 已有重连计划在排队
+  reconnecting.value = true;
+  const MAX_RECONNECT_DELAY = 30_000;
+  const delay = Math.min(1000 * 2 ** reconnectAttempts, MAX_RECONNECT_DELAY) * (0.7 + Math.random() * 0.6);
+  reconnectAttempts++;
+  console.warn(`[chat] ws closed, reconnect in ${Math.round(delay)}ms (attempt ${reconnectAttempts})`);
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = null;
+    connectSocket();
+  }, delay);
+}
+
+/** 彻底清理连接（页面卸载/结束会话）：取消重连与心跳，关闭连接 */
+function cleanupSocket() {
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  reconnectAttempts = 0;
+  reconnecting.value = false;
+  stopHeartbeat();
+  if (socket.value) {
+    socket.value.onclose = null; // 手动关闭，不触发重连
+    socket.value.close();
+    socket.value = null;
+  }
 }
 
 /**
@@ -439,6 +535,7 @@ function connectSocket() {
  * - ai_stream：首包创建 AI 气泡（id=Date.now()），后续 delta 追加 → 增量渲染
  * - ai_done：用完整文本覆盖气泡（防流式丢字），流结束并自动 TTS 朗读
  * - ai_error：移除空白气泡 + toast 服务端原因
+ * - user_message：房间内其他端发来的用户消息（多端同步）
  */
 function handleWSMessage(payload: any) {
   const event = payload.event;
@@ -446,6 +543,13 @@ function handleWSMessage(payload: any) {
 
   if (event === "joined") {
     // 加入成功
+  } else if (event === "user_message") {
+    // 同会话其他设备发送的用户消息：直接插入气泡（发送端本地已乐观渲染，不会重复）
+    const content: string = data.content ?? "";
+    if (content) {
+      messages.value.push({ id: Date.now(), role: "user", content });
+      scrollToBottom();
+    }
   } else if (event === "ai_stream") {
     const delta: string = data.delta ?? "";
     if (!delta) return;
@@ -509,7 +613,7 @@ async function sendText() {
     messages.value.push({
       id: Date.now() + 1,
       role: "assistant",
-      content: "WebSocket 未连接，请确认已登录且后端已启动",
+      content: "连接未建立，请确认已登录且后端已启动",
     });
     return;
   }
@@ -555,6 +659,12 @@ function pickQaMime(): string {
   return "";
 }
 
+/** QA 录音最长时间（毫秒）：超长会触发后端 base64 7MB 守卫报错，60s 自动停更友好 */
+const QA_MAX_RECORD_MS = 60_000;
+let recordMaxTimer: number | null = null;
+/** 约束降级提示只弹一次（避免每段录音都打扰） */
+let echoWarned = false;
+
 /**
  * 开始录音：getUserMedia（带回声消除/降噪约束）→ MediaRecorder 采集；
  * 停止后组装 Blob 交给 doTranscribe。
@@ -575,6 +685,20 @@ function startRecord() {
     .then((stream) => {
       h5Stream = stream;
       h5Chunks = [];
+
+      // 约束生效自检（2026-08-17）：{ ideal } 是"尽力而为"，部分设备会静默降级——
+      // 读实际值确认回声消除是否真生效，否则"以为有 AEC 其实没有"是回声盲区
+      const track = stream.getAudioTracks()[0];
+      const settings = track?.getSettings?.();
+      if (settings && settings.echoCancellation === false && !echoWarned) {
+        echoWarned = true;
+        console.warn("[chat] echoCancellation 未生效（设备/浏览器降级），建议佩戴耳机");
+        showToast("当前设备回声消除未生效，建议佩戴耳机");
+      }
+      if (settings && settings.noiseSuppression === false) {
+        console.warn("[chat] noiseSuppression 未生效，环境噪声将进入识别");
+      }
+
       const mime = pickQaMime();
       try {
         h5Recorder = new MediaRecorder(
@@ -594,6 +718,10 @@ function startRecord() {
         showToast("录音异常，请重试");
       };
       h5Recorder.onstop = () => {
+        if (recordMaxTimer !== null) {
+          clearTimeout(recordMaxTimer);
+          recordMaxTimer = null;
+        }
         h5Stream?.getTracks().forEach((t) => t.stop());
         h5Stream = null;
         recording.value = false;
@@ -608,6 +736,13 @@ function startRecord() {
       };
       h5Recorder.start();
       recording.value = true;
+      // 60s 自动停止：防按住不放录到超长（base64 7MB 上限），到点提示并触发 onstop 转写
+      recordMaxTimer = window.setTimeout(() => {
+        if (h5Recorder && h5Recorder.state === "recording") {
+          showToast("录音已达 60 秒上限");
+          h5Recorder.stop();
+        }
+      }, QA_MAX_RECORD_MS);
     })
     .catch((err) => {
       console.error("[chat] mic error", err);
@@ -686,8 +821,32 @@ async function addWordToLibrary() {
 // ── TTS 播放 ──
 // 过长的文本不自动播放：TTS 有字数/时长限制，播放会被截断且白白消耗额度
 const MAX_AUTO_TTS_LEN = 300;
+/** TTS 结果内存缓存（key=voice:text → Blob）：重听/点词重复朗读不再重复合成，省调用省额度 */
+const ttsCache = new Map<string, Blob>();
+const TTS_CACHE_MAX = 50;
+
+/** 带缓存的 TTS 合成：命中直接返回，未命中合成后入缓存（Map 迭代序=插入序，超限淘汰最旧） */
+async function cachedSynthesize(text: string, voice?: string): Promise<Blob> {
+  const key = `${voice ?? ""}:${text}`;
+  const hit = ttsCache.get(key);
+  if (hit) return hit;
+  const blob = await speechApi.synthesize(text, voice);
+  if (ttsCache.size >= TTS_CACHE_MAX) {
+    const oldest = ttsCache.keys().next().value;
+    if (oldest !== undefined) ttsCache.delete(oldest);
+  }
+  ttsCache.set(key, blob);
+  return blob;
+}
+
+/** 恢复聆听的 8s 兜底定时器（页面卸载/释放音频时清理） */
+let ttsTailTimer: number | null = null;
 
 function releaseAudio() {
+  if (ttsTailTimer !== null) {
+    clearTimeout(ttsTailTimer);
+    ttsTailTimer = null;
+  }
   if (audioUrl) {
     URL.revokeObjectURL(audioUrl);
     audioUrl = null;
@@ -706,14 +865,14 @@ async function playTts(text: string) {
   // 播放前：live 模式先暂停聆听（TTS 播完再恢复），防回声入麦
   if (mode.value === "live" && liveStarted.value) voiceDetector.pause();
   try {
-    const blob = await speechApi.synthesize(text);
+    const blob = await cachedSynthesize(text);
     releaseAudio();
     audioUrl = URL.createObjectURL(blob);
     if (!audioEl) audioEl = new Audio();
     audioEl.src = audioUrl;
     audioEl.volume = 0.7; // 轻微降低外放音量，减小回声能量（不影响听感）
     audioEl.play().catch(() => {});
-    // 播完/超时后恢复聆听（8s 超时兜底为"降音量 0.25 + 恢复"，不截断 TTS，见 resumeLiveAfterReply）
+    // 播完/超时后恢复聆听（见 resumeLiveAfterReply：播放进度优先，8s 降音量兜底）
     resumeLiveAfterReply();
   } catch (e: any) {
     console.error("[chat] tts error", e);
@@ -723,12 +882,11 @@ async function playTts(text: string) {
   }
 }
 
-/** 结束会话：停聆听 → 关 WS → 调 end 接口记录 → 返回上一页 */
+/** 结束会话：停聆听 → 断开 WS（含取消重连/心跳）→ 调 end 接口记录 → 返回上一页 */
 async function endChat() {
   stopLive();
   try {
-    socket.value?.close();
-    socket.value = null;
+    cleanupSocket();
     await conversationApi.end(conversationId.value, {});
     showSuccessToast("对话已结束");
   } catch (e) {
