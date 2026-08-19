@@ -37,6 +37,12 @@ const routes = [
     component: () => import("@/pages/chat.vue"),
     meta: { tab: false, title: "AI 对话" },
   },
+  {
+    path: "/review",
+    name: "review",
+    component: () => import("@/pages/review.vue"),
+    meta: { tab: false, title: "今日练习" },
+  },
 ];
 
 const router = createRouter({

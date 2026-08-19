@@ -25,7 +25,7 @@
           <span class="review-unit">个生词等待回顾</span>
         </div>
       </div>
-      <div class="review-btn" @click="goLearning">
+      <div class="review-btn" @click="goReview">
         <img :src="iconPlay" width="28" height="28" alt="play" />
         <span>开始</span>
       </div>
@@ -47,28 +47,37 @@
       </div>
     </section>
 
-    <!-- 继续练习 -->
-    <div class="section-head">
-      <span class="section-title">继续练习</span>
-      <span class="section-more" @click="goScenarios">全部场景 ></span>
-    </div>
-    <section class="continue-card" @click="goChat(featuredScenes[0])" ref="continueRef">
-      <div class="scene-icon">
-        <img :src="iconCoffee" width="36" height="36" alt="coffee" />
+    <!-- 继续练习（最近一次会话，可删除） -->
+    <template v-if="lastConversation">
+      <div class="section-head">
+        <span class="section-title">继续练习</span>
+        <span class="section-more" @click="goScenarios">全部场景 ></span>
       </div>
-      <div class="continue-mid">
-        <div class="continue-name">咖啡店点单 · 初级</div>
-        <div class="continue-desc">上次对话 12/14，再接再厉！</div>
-      </div>
-      <div class="continue-btn">继续</div>
-    </section>
+      <section class="continue-card" @click="goChat(lastScene)" ref="continueRef">
+        <div class="scene-icon">
+          <img :src="sceneIcon" width="36" height="36" alt="scene" />
+        </div>
+        <div class="continue-mid">
+          <div class="continue-name">{{ lastConversation.scenario_name }}</div>
+          <div class="continue-desc">
+            {{ lastConversation.duration ? `上次练习 ${formatDuration(lastConversation.duration)}` : "上次练习未完，继续加油！" }} · {{ formatRelative(lastConversation.started_at) }}
+          </div>
+        </div>
+        <div class="continue-right">
+          <div class="continue-btn">继续</div>
+          <button class="del-btn" @click.stop="deleteConversation">
+            <img :src="iconTrash" width="15" height="15" alt="删除" />
+          </button>
+        </div>
+      </section>
+    </template>
 
     <!-- 今日生词 -->
     <div class="section-head">
       <span class="section-title">今日生词</span>
       <span class="section-more" @click="goLearning">查看全部 ></span>
     </div>
-    <section class="word-item" v-for="(w, i) in todayWords" :key="w.en" @click="goLearning" :ref="(el) => setWordRef(el, i)">
+    <section class="word-item" v-for="(w, i) in todayWords" :key="w.en" @click="goReview" :ref="(el) => setWordRef(el, i)">
       <div class="word-body">
         <div class="word-en">{{ w.en }}</div>
         <div class="word-zh">{{ w.zh }}</div>
@@ -79,12 +88,20 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onActivated } from "vue";
+import { ref, computed, onMounted, onActivated } from "vue";
 import { useRouter } from "vue-router";
+import { showConfirmDialog, showSuccessToast, showToast } from "vant";
 import gsap from "gsap";
+import { learningApi, conversationApi } from "@/api";
 import iconMascot from "@/assets/icons/mascot.svg";
 import iconPlay from "@/assets/icons/play-cartoon.svg";
 import iconCoffee from "@/assets/icons/icon-coffee.svg";
+import iconPlane from "@/assets/icons/icon-plane.svg";
+import iconInterview from "@/assets/icons/icon-interview.svg";
+import iconRestaurant from "@/assets/icons/icon-restaurant.svg";
+import iconHotel from "@/assets/icons/icon-hotel.svg";
+import iconDefault from "@/assets/icons/icon-default.svg";
+import iconTrash from "@/assets/icons/icon-trash.svg";
 
 const router = useRouter();
 const nickname = ref("Learner");
@@ -93,22 +110,120 @@ const masteredWords = ref(128);
 const minutes = ref(45);
 const todoWords = ref(12);
 
-interface Scene {
-  id: number;
-  name: string;
+/** 今日学习计划（真实数据：待复习数 / 已掌握 / 今日新词 / 连续天数；接口失败保留默认展示值） */
+const daily = ref<any>(null);
+
+/** 拉取今日学习计划（每次切回首页都刷新，进度实时） */
+async function loadDaily() {
+  try {
+    const d = await learningApi.daily();
+    daily.value = d;
+    todoWords.value = d.reviews_due ?? 0;
+    masteredWords.value = d.mastered_total ?? 0;
+    streak.value = d.streak_days ?? 0;
+  } catch {
+    /* 未登录 / 接口异常时保留默认值 */
+  }
 }
 
-const featuredScenes = ref<Scene[]>([
-  { id: 1, name: "咖啡店点单" },
-  { id: 4, name: "机场值机" },
-  { id: 7, name: "求职面试" },
-  { id: 11, name: "餐厅订位" },
-]);
+/** mastery → 熟练度等级数字（配合 lv-1 ~ lv-4 徽章配色） */
+function masteryLevel(m: number) {
+  if (m >= 80) return 4;
+  if (m >= 60) return 3;
+  if (m >= 35) return 2;
+  return 1;
+}
 
-const todayWords = ref([
-  { en: "espresso", zh: "n. 浓缩咖啡", lv: 2, level: "Lv.2 熟悉" },
-  { en: "baggage", zh: "n. 行李", lv: 1, level: "Lv.1 生疏" },
-]);
+/** mastery → 等级文案 */
+function masteryLabel(m: number) {
+  if (m >= 80) return "L4 精通";
+  if (m >= 60) return "L3 掌握";
+  if (m >= 35) return "L2 熟悉";
+  return "L1 生疏";
+}
+
+/** 今日生词列表（真实数据：今日已通过「每日新词」学习的单词） */
+const todayWords = computed(() =>
+  (daily.value?.today_words ?? []).map((w: any) => ({
+    en: w.content,
+    zh: w.meaning ?? "—",
+    lv: masteryLevel(w.mastery),
+    level: masteryLabel(w.mastery),
+  })),
+);
+
+/** 最近一次会话（首页"继续练习"卡片数据；无会话时整块隐藏） */
+const lastConversation = ref<any>(null);
+
+/** 拉取会话列表取最近一条（倒序第一条，附带场景名） */
+async function loadConversations() {
+  try {
+    const list = await conversationApi.list();
+    lastConversation.value = list?.[0] ?? null;
+  } catch {
+    /* 未登录 / 接口异常时隐藏继续练习卡片 */
+    lastConversation.value = null;
+  }
+}
+
+/** 继续练习点击跳转参数（场景 id + 名称） */
+const lastScene = computed(() => ({
+  id: lastConversation.value?.scenario_id ?? 0,
+  name: lastConversation.value?.scenario_name ?? "AI 对话",
+}));
+
+/** 最近会话的场景图标：按场景名匹配卡通图标（与场景库一致） */
+const sceneIcon = computed(() => {
+  const name = lastConversation.value?.scenario_name ?? "";
+  if (name.includes("咖啡") || name.includes("café") || name.includes("Cafe")) return iconCoffee;
+  if (name.includes("机场") || name.includes("flight") || name.includes("Flight") || name.includes("值机")) return iconPlane;
+  if (name.includes("面试") || name.includes("interview") || name.includes("Interview")) return iconInterview;
+  if (name.includes("餐厅") || name.includes("restaurant") || name.includes("Restaurant") || name.includes("订位")) return iconRestaurant;
+  if (name.includes("酒店") || name.includes("hotel") || name.includes("Hotel")) return iconHotel;
+  return iconDefault;
+});
+
+/** 时长（秒）→ 中文文案 */
+function formatDuration(sec: number) {
+  if (sec >= 60) return `${Math.floor(sec / 60)} 分钟`;
+  return `${sec} 秒`;
+}
+
+/** 时间 → 相对文案（刚刚 / N 分钟前 / N 小时前 / N 天前 / 日期） */
+function formatRelative(dateStr: string) {
+  const d = new Date(dateStr);
+  const diff = Date.now() - d.getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "刚刚";
+  if (mins < 60) return `${mins} 分钟前`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days} 天前`;
+  return d.toLocaleDateString();
+}
+
+/** 删除最近一次会话：确认后调接口，删完重新拉取（更早的会话顶上） */
+async function deleteConversation() {
+  if (!lastConversation.value) return;
+  try {
+    await showConfirmDialog({
+      title: "删除对话",
+      message: `确定删除「${lastConversation.value.scenario_name}」的这段对话记录吗？删除后不可恢复。`,
+      confirmButtonText: "删除",
+      cancelButtonText: "取消",
+    });
+  } catch {
+    return; // 用户取消
+  }
+  try {
+    await conversationApi.delete(lastConversation.value.id);
+    showSuccessToast("已删除");
+    loadConversations();
+  } catch {
+    showToast("删除失败");
+  }
+}
 
 const greetRef = ref<HTMLElement | null>(null);
 const reviewRef = ref<HTMLElement | null>(null);
@@ -154,11 +269,15 @@ function playIntro() {
 onMounted(() => {
   const saved = localStorage.getItem("nickname");
   if (saved) nickname.value = saved;
+  loadDaily();
+  loadConversations();
 });
 
 // keep-alive 缓存下，每次切回该 tab 重新播放入场动画（首次挂载也会触发）
 onActivated(() => {
   playIntro();
+  loadDaily(); // 每次回到首页刷新今日进度
+  loadConversations(); // 每次回到首页刷新最近会话（可能被删除或新增）
 });
 
 /** 导航：首页 → 场景库 */
@@ -176,9 +295,21 @@ function goLearning() {
   router.push("/learning");
 }
 
-/** 导航：进入对话页，场景信息通过 query 传递（聊天页头部直接展示场景名） */
-function goChat(scene: Scene) {
-  router.push({ path: "/chat", query: { scenarioId: scene.id, scenarioName: scene.name } });
+/** 导航：进入今日练习（复习 + 每日新词意思匹配） */
+function goReview() {
+  router.push("/review");
+}
+
+/** 导航：进入对话页。
+ * "继续练习"卡片（最近会话）携带 conversationId → chat 页恢复该会话上下文继续对话；
+ * 其他入口只传场景信息，chat 页会创建新会话。
+ */
+function goChat(scene: { id: number; name: string }) {
+  const query: Record<string, string> = { scenarioId: String(scene.id), scenarioName: scene.name };
+  if (lastConversation.value?.id) {
+    query.conversationId = String(lastConversation.value.id);
+  }
+  router.push({ path: "/chat", query });
 }
 </script>
 
@@ -405,6 +536,13 @@ function goChat(scene: Scene) {
     }
   }
 
+  .continue-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+
   .continue-btn {
     height: 36px;
     padding: 0 18px;
@@ -417,6 +555,25 @@ function goChat(scene: Scene) {
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+  }
+
+  /* 删除对话按钮：浅红底 + 红色描边，与语义色系统一致（白卡上清晰可辨） */
+  .del-btn {
+    width: 32px;
+    height: 32px;
+    border: 1px solid rgba(242, 149, 138, 0.5);
+    border-radius: 10px;
+    background: rgba(242, 149, 138, 0.14);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: transform 0.15s ease, background 0.2s ease;
+
+    &:active {
+      transform: scale(0.9);
+      background: rgba(242, 149, 138, 0.3);
+    }
   }
 }
 
@@ -471,6 +628,16 @@ function goChat(scene: Scene) {
   .lv-1 {
     background: rgba(250, 158, 51, 0.18);
     color: var(--c-orange-text);
+  }
+
+  .lv-3 {
+    background: rgba(13, 186, 156, 0.18);
+    color: var(--c-primary-deep);
+  }
+
+  .lv-4 {
+    background: rgba(10, 107, 92, 0.18);
+    color: var(--c-primary-deep);
   }
 }
 </style>

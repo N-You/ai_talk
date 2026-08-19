@@ -31,6 +31,24 @@
       </div>
     </section>
 
+    <!-- 今日学习入口（复习 + 每日新词，进度实时） -->
+    <section class="today-card" @click="goReview">
+      <div class="today-left">
+        <span class="today-tag">今日学习</span>
+        <div class="today-row">
+          <span class="today-num">{{ daily?.new_done ?? 0 }}/{{ daily?.goal ?? 5 }}</span>
+          <span class="today-label">新词</span>
+          <span class="today-sep">·</span>
+          <span class="today-num">{{ daily?.reviews_due ?? 0 }}</span>
+          <span class="today-label">待复习</span>
+        </div>
+      </div>
+      <div class="today-go">
+        <span>去练习</span>
+        <img :src="iconArrowRight" width="14" height="14" alt="go" />
+      </div>
+    </section>
+
     <!-- 熟练度等级说明 -->
     <section class="level-bar">
       <div v-for="lv in levels" :key="lv.key" class="level-item" :class="`lv-${lv.key}`">
@@ -198,6 +216,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onActivated } from "vue";
+import { useRouter } from "vue-router";
 import { showToast, showSuccessToast } from "vant";
 import gsap from "gsap";
 import { learningApi } from "@/api";
@@ -205,6 +224,26 @@ import level1Icon from "@/assets/icons/level-1.svg";
 import level2Icon from "@/assets/icons/level-2.svg";
 import level3Icon from "@/assets/icons/level-3.svg";
 import level4Icon from "@/assets/icons/level-4.svg";
+import iconArrowRight from "@/assets/icons/icon-arrow-right.svg";
+
+const router = useRouter();
+
+/** 今日学习计划（新词进度 / 待复习数，接口失败时显示默认值） */
+const daily = ref<any>(null);
+
+/** 拉取今日学习计划（切回本页时刷新进度） */
+async function loadDaily() {
+  try {
+    daily.value = await learningApi.daily();
+  } catch {
+    /* 未登录 / 接口异常时忽略，横幅显示默认值 */
+  }
+}
+
+/** 导航：进入今日练习页（复习 + 每日新词意思匹配） */
+function goReview() {
+  router.push("/review");
+}
 
 interface LearningItem {
   id: number;
@@ -303,6 +342,7 @@ function setItemRef(el: unknown, i: number) {
 
 onMounted(() => {
   fetchItems();
+  loadDaily();
 });
 
 // GSAP：卡片依次浮现（每次激活重放）
@@ -319,6 +359,7 @@ function playIntro() {
 // keep-alive 缓存下，每次切回该 tab 重新播放入场动画
 onActivated(() => {
   playIntro();
+  loadDaily(); // 回到本页刷新今日学习进度
 });
 
 // 搜索防抖
@@ -520,6 +561,78 @@ function formatReviewTime(dateStr: string) {
         background: #fff;
       }
     }
+  }
+}
+
+/* 今日学习入口横幅 */
+.today-card {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 78px;
+  padding: 0 18px;
+  border-radius: var(--radius-md);
+  background: var(--grad-brand);
+  box-shadow: var(--shadow-float);
+  margin: 14px 0 10px;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+
+  &:active {
+    transform: scale(0.98);
+  }
+
+  .today-left {
+    .today-tag {
+      display: inline-flex;
+      align-items: center;
+      height: 22px;
+      padding: 0 10px;
+      border-radius: var(--radius-pill);
+      background: rgba(255, 255, 255, 0.22);
+      color: #fff;
+      font-size: 10px;
+      font-weight: 600;
+    }
+
+    .today-row {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      margin-top: 7px;
+
+      .today-num {
+        font-size: 20px;
+        font-weight: 700;
+        color: #fff;
+        line-height: 1;
+      }
+
+      .today-label {
+        font-size: 11px;
+        color: #e6fff7;
+      }
+
+      .today-sep {
+        color: rgba(255, 255, 255, 0.5);
+        font-size: 12px;
+      }
+    }
+  }
+
+  .today-go {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 34px;
+    padding: 0 14px;
+    border-radius: 17px;
+    background: #fff;
+    color: var(--c-primary);
+    font-size: 12px;
+    font-weight: 600;
+    flex-shrink: 0;
   }
 }
 

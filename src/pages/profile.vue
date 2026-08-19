@@ -50,12 +50,12 @@
       <div class="goal-row">
         <div class="goal-left">
           <div class="goal-name">每日新词目标</div>
-          <div class="goal-desc">掌握 5 个新单词</div>
+          <div class="goal-desc">掌握 {{ goalWords }} 个新单词</div>
         </div>
         <div class="stepper">
-          <button class="step-btn step-minus" @click="goalWords = Math.max(1, goalWords - 1)">−</button>
+          <button class="step-btn step-minus" @click="changeGoal(-1)">−</button>
           <span class="step-val">{{ goalWords }} 词</span>
-          <button class="step-btn step-plus" @click="goalWords = Math.min(30, goalWords + 1)">＋</button>
+          <button class="step-btn step-plus" @click="changeGoal(1)">＋</button>
         </div>
       </div>
     </section>
@@ -109,9 +109,9 @@
       <div class="setting-block">
         <div class="setting-head">
           <span class="setting-label">AI 语速</span>
-          <span class="setting-value">正常 1.0x</span>
+          <span class="setting-value">{{ speedLabel }}</span>
         </div>
-        <van-slider v-model="speed" :min="0.5" :max="1.5" :step="0.1" :bar-height="4" active-color="#0DBA9C" />
+        <van-slider v-model="speed" :min="0.5" :max="1.5" :step="0.1" :bar-height="4" active-color="#0DBA9C" @change="onSpeedChange" />
       </div>
 
       <!-- 口音偏好 -->
@@ -134,7 +134,7 @@
           <span class="setting-label">对话风格 (Temperature)</span>
           <span class="setting-value">{{ temperature }} · {{ temperatureLabel }}</span>
         </div>
-        <van-slider v-model="temperature" :min="0" :max="1.5" :step="0.1" :bar-height="4" active-color="#0DBA9C" />
+        <van-slider v-model="temperature" :min="0" :max="1.5" :step="0.1" :bar-height="4" active-color="#0DBA9C" @change="onTempChange" />
       </div>
 
       <!-- 高级配置入口 -->
@@ -337,6 +337,34 @@ const temperatureLabel = computed(() => {
   return "发散";
 });
 
+/** 语速文案：<1 慢速 / =1 正常 / >1 快速（TTS rate 倍率） */
+const speedLabel = computed(() => {
+  const v = speed.value;
+  if (v > 1.05) return `快速 ${v.toFixed(1)}x`;
+  if (v < 0.95) return `慢速 ${v.toFixed(1)}x`;
+  return "正常 1.0x";
+});
+
+/**
+ * 滑块拖动结束（change 事件，非拖动过程）→ 保存对应设置到后端。
+ * 后端 settings 为 merge 式保存，只传单字段不会影响 apiKey / model 等其他配置。
+ */
+function onSpeedChange(v: number | string) {
+  speed.value = Number(v);
+  saveSetting({ speed: speed.value });
+}
+
+function onTempChange(v: number | string) {
+  temperature.value = Number(v);
+  saveSetting({ temperature: temperature.value });
+}
+
+/** 保存单个设置字段（未登录仅本地生效，不持久化） */
+function saveSetting(patch: { speed?: number; temperature?: number }) {
+  if (!getToken()) return;
+  userApi.updateSettings(patch).catch(() => showToast("设置保存失败"));
+}
+
 const userRef = ref<HTMLElement | null>(null);
 
 // GSAP：用户卡入场（每次激活重放）
@@ -388,6 +416,18 @@ function doLogout() {
   showToast("已退出");
 }
 
+/**
+ * 每日新词目标调整：本地更新 + 持久化到后端 settings.dailyWordGoal。
+ * 后端为 merge 式保存，不会覆盖已配置的 apiKey/apiBase/model。
+ */
+function changeGoal(delta: number) {
+  goalWords.value = Math.min(30, Math.max(1, goalWords.value + delta));
+  if (!getToken()) return; // 未登录不持久化
+  userApi
+    .updateSettings({ dailyWordGoal: goalWords.value })
+    .catch(() => showToast("目标保存失败，请检查网络"));
+}
+
 /** 占位：未实现功能统一提示"开发中" */
 function noImplement() {
   showToast("开发中");
@@ -407,10 +447,20 @@ function openSettings() {
  * 拉取用户 AI 配置：
  * 有自定义配置 → 回填表单 + settingsSource=user + 合并自定义模型列表；
  * 否则 settingsSource=env（服务端 .env 默认）。
+ * 同时恢复每日新词目标 / 语速 / Temperature（未设置时保持默认值）。
  */
 async function loadSettings() {
   try {
     const s = await userApi.getSettings();
+    if (typeof s.dailyWordGoal === "number") {
+      goalWords.value = Math.min(30, Math.max(1, s.dailyWordGoal));
+    }
+    if (typeof s.speed === "number") {
+      speed.value = Math.min(1.5, Math.max(0.5, s.speed));
+    }
+    if (typeof s.temperature === "number") {
+      temperature.value = Math.min(1.5, Math.max(0, s.temperature));
+    }
     const hasUser = s.apiKey || s.apiBase || s.model;
     if (hasUser) {
       if (s.apiBase) aiSettings.apiBase = s.apiBase;

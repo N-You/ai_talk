@@ -109,8 +109,14 @@ export const userApi = {
   updateProfile: (data: any) =>
     request<any>({ url: "/api/user/profile", method: "PUT", data }),
   getSettings: () => request<any>({ url: "/api/user/settings" }),
-  updateSettings: (data: { apiKey?: string; apiBase?: string; model?: string }) =>
-    request<any>({ url: "/api/user/settings", method: "PUT", data }),
+  updateSettings: (data: {
+    apiKey?: string;
+    apiBase?: string;
+    model?: string;
+    dailyWordGoal?: number;
+    speed?: number;
+    temperature?: number;
+  }) => request<any>({ url: "/api/user/settings", method: "PUT", data }),
 };
 
 // 场景
@@ -130,6 +136,9 @@ export const conversationApi = {
   detail: (id: number) => request<any>({ url: `/api/conversations/${id}` }),
   end: (id: number, data: any) =>
     request<any>({ url: `/api/conversations/${id}/end`, method: "PUT", data }),
+  /** 删除会话（消息级联删除；仅能删自己的） */
+  delete: (id: number) =>
+    request<any>({ url: `/api/conversations/${id}`, method: "DELETE" }),
   /** 单词释义查询（对话中点击单词弹窗）：返回 { word, phonetic, meaning, example } */
   explainWord: (word: string) =>
     request<any>({ url: "/api/conversations/explain-word", method: "POST", data: { word } }),
@@ -149,8 +158,8 @@ export const learningApi = {
     }
     return request<any>({ url: `/api/learning-items${qs}` });
   },
-  add: (content: string) =>
-    request<any>({ url: "/api/learning-items", method: "POST", data: { content } }),
+  add: (content: string, meta?: { meaning?: string; phonetic?: string; example?: string }) =>
+    request<any>({ url: "/api/learning-items", method: "POST", data: { content, ...meta } }),
   detail: (id: number) => request<any>({ url: `/api/learning-items/${id}` }),
   delete: (id: number) =>
     request<any>({ url: `/api/learning-items/${id}`, method: "DELETE" }),
@@ -160,6 +169,20 @@ export const learningApi = {
       method: "POST",
       data: { result },
     }),
+  /**
+   * 今日学习计划：{ goal, new_done, new_total, reviews_due, reviews_done,
+   * mastered_total, streak_days, today_words }。首页/生词本/练习页共用。
+   */
+  daily: () => request<any>({ url: "/api/learning-items/daily" }),
+  /**
+   * 单词-意思匹配测验：type ∈ new/review/mixed，count 题目数。
+   * 返回 { items: [{ id, content, phonetic, is_new, options[], answer_index }], mode, total }。
+   */
+  quiz: (type: "new" | "review" | "mixed" = "mixed", count = 10) =>
+    request<any>({ url: `/api/learning-items/quiz?type=${type}&count=${count}` }),
+  /** 完成一个新词学习（意思匹配答对后调用）：标记今日进度 + 次日进入复习队列 */
+  learn: (id: number) =>
+    request<any>({ url: `/api/learning-items/${id}/learn`, method: "POST", data: {} }),
 };
 
 // 语音 (ASR: 录音文件 -> 文本)
@@ -197,7 +220,8 @@ export const speechApi = {
     }
   },
   // TTS: 文本 -> 音频 Blob（30s 超时：防上游挂起让"播放/聆听恢复"永久等待，与 chunkedUpload 对齐）
-  synthesize: async (text: string, voice?: string): Promise<Blob> => {
+  // speed: 语速倍率 0.5~1.5（后端映射为 DashScope rate，默认 1）
+  synthesize: async (text: string, voice?: string, speed?: number): Promise<Blob> => {
     const t = getToken();
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 30_000);
@@ -208,7 +232,7 @@ export const speechApi = {
           "Content-Type": "application/json",
           ...(t ? { Authorization: `Bearer ${t}` } : {}),
         },
-        body: JSON.stringify({ text, voice }),
+        body: JSON.stringify({ text, voice, ...(speed && speed !== 1 ? { speed } : {}) }),
         signal: ctrl.signal,
       });
       if (resp.status === 401) {

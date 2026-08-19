@@ -170,7 +170,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { showToast, showSuccessToast } from "vant";
 import gsap from "gsap";
-import { conversationApi, learningApi, speechApi, getToken, WS_URL } from "@/api";
+import { conversationApi, learningApi, speechApi, userApi, getToken, WS_URL } from "@/api";
 import { useVoiceDetector } from "@/composables/useVoiceDetector";
 import iconMascotMini from "@/assets/icons/mascot-mini.svg";
 
@@ -383,6 +383,7 @@ function onScroll() {
 }
 
 onMounted(() => {
+  loadUserSpeed(); // 拉取用户语速设置（TTS 朗读用）
   initConversation();
 });
 
@@ -392,14 +393,40 @@ onUnmounted(() => {
   releaseAudio();
 });
 
-/** 初始化会话：创建会话记录 → 拿到 conversation_id → 建立 WebSocket 连接 */
-async function initConversation() {
+/** 拉取用户语速设置（settings.speed，0.5~1.5），TTS 自动朗读/点词发音共用；失败静默保持默认 1 */
+async function loadUserSpeed() {
   try {
+    const s = await userApi.getSettings();
+    if (typeof s.speed === "number") ttsSpeed.value = Math.min(1.5, Math.max(0.5, s.speed));
+  } catch {
+    /* 未登录 / 接口异常时用默认语速 */
+  }
+}
+
+/** 初始化会话：
+ * 1. query 携带 conversationId（首页"继续练习"）→ 恢复已有会话：拉历史消息渲染，直接 join 继续对话
+ * 2. 否则（场景库/今日生词入口）→ 创建新会话 → join
+ */
+async function initConversation() {  const resumeId = Number(route.query.conversationId) || 0;
+  try {
+    if (resumeId) {
+      // 恢复模式：detail 返回会话 + 历史消息 + 场景
+      const conv = await conversationApi.detail(resumeId);
+      conversationId.value = conv.id;
+      if (conv.scenario?.name) scenarioName.value = conv.scenario.name;
+      // 历史消息按时间正序渲染（主键自增即创建顺序）
+      messages.value = (conv.messages ?? [])
+        .filter((m: any) => m.role === "user" || m.role === "assistant")
+        .map((m: any) => ({ id: m.id, role: m.role, content: m.content }));
+      connectSocket();
+      nextTick(scrollToBottom); // 恢复后滚动到底部，看到上次最后一条消息
+      return;
+    }
     const conv = await conversationApi.create(scenarioId.value);
     conversationId.value = conv.id;
     connectSocket();
   } catch (e) {
-    showToast("创建对话失败");
+    showToast("对话初始化失败");
   }
 }
 
@@ -806,11 +833,15 @@ async function openWordModal(word: string) {
   }
 }
 
-/** 释义弹窗 → 加入生词本（幂等，重复添加自动复用） */
+/** 释义弹窗 → 加入生词本（幂等，重复添加自动复用；携带 LLM 已查到的释义/音标/例句） */
 async function addWordToLibrary() {
   if (!wordInfo.value) return;
   try {
-    await learningApi.add(wordInfo.value.word);
+    await learningApi.add(wordInfo.value.word, {
+      meaning: wordInfo.value.meaning,
+      phonetic: wordInfo.value.phonetic,
+      example: wordInfo.value.example,
+    });
     showSuccessToast("已加入生词本");
     showWordModal.value = false;
   } catch (e) {
@@ -821,16 +852,18 @@ async function addWordToLibrary() {
 // ── TTS 播放 ──
 // 过长的文本不自动播放：TTS 有字数/时长限制，播放会被截断且白白消耗额度
 const MAX_AUTO_TTS_LEN = 300;
-/** TTS 结果内存缓存（key=voice:text → Blob）：重听/点词重复朗读不再重复合成，省调用省额度 */
+/** 用户设置的 AI 语速（settings.speed，0.5~1.5，默认 1；进入页面时拉取） */
+const ttsSpeed = ref(1);
+/** TTS 结果内存缓存（key=voice:speed:text → Blob）：重听/点词重复朗读不再重复合成，省调用省额度 */
 const ttsCache = new Map<string, Blob>();
 const TTS_CACHE_MAX = 50;
 
 /** 带缓存的 TTS 合成：命中直接返回，未命中合成后入缓存（Map 迭代序=插入序，超限淘汰最旧） */
 async function cachedSynthesize(text: string, voice?: string): Promise<Blob> {
-  const key = `${voice ?? ""}:${text}`;
+  const key = `${voice ?? ""}:${ttsSpeed.value}:${text}`;
   const hit = ttsCache.get(key);
   if (hit) return hit;
-  const blob = await speechApi.synthesize(text, voice);
+  const blob = await speechApi.synthesize(text, voice, ttsSpeed.value);
   if (ttsCache.size >= TTS_CACHE_MAX) {
     const oldest = ttsCache.keys().next().value;
     if (oldest !== undefined) ttsCache.delete(oldest);
