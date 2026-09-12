@@ -661,26 +661,16 @@ function cleanupSocket() {
 }
 
 /**
- * 流式事件协议分发（与后端 ConversationGateway 对应）：
+ * 流式事件协议分发（与后端 ConversationGateway 对应，单连接直推无多端同步）：
  * - ai_stream：首包创建 AI 气泡（id=Date.now()），后续 delta 追加 → 增量渲染
  * - ai_done：用完整文本覆盖气泡（防流式丢字），流结束并自动 TTS 朗读
  * - ai_error：移除空白气泡 + toast 服务端原因
- * - user_message：房间内其他端发来的用户消息（多端同步）
  */
 function handleWSMessage(payload: any) {
   const event = payload.event;
   const data = payload.data ?? payload;
 
-  if (event === "joined") {
-    // 加入成功
-  } else if (event === "user_message") {
-    // 同会话其他设备发送的用户消息：直接插入气泡（发送端本地已乐观渲染，不会重复）
-    const content: string = data.content ?? "";
-    if (content) {
-      messages.value.push({ id: Date.now(), role: "user", content });
-      scrollToBottom();
-    }
-  } else if (event === "ai_stream") {
+  if (event === "ai_stream") {
     const delta: string = data.delta ?? "";
     if (!delta) return;
 
