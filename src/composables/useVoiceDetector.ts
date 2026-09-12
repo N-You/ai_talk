@@ -56,11 +56,15 @@ export interface VoiceDetectorOptions {
   maxIdleChunks?: number;
   /** 每切出一个语音段回调 */
   onSegment?: (blob: Blob, mimeType: string) => void;
+  /** 检测到"说话开始"回调（能量首次突破触发阈值瞬间，2026-08-22）：
+   *  供 barge-in 打断用——TTS 播放中 VAD 保持聆听，用户一开口立即通知
+   *  调用方停掉 TTS（回声源消失后录音才干净，否则用户声音会与 TTS 外放混音） */
+  onSpeechStart?: () => void;
 }
 
 /** 默认参数（经实测调优，详见 docs/音频识别优化方案.md） */
-const DEFAULT_OPTIONS: Omit<Required<VoiceDetectorOptions>, "onSegment"> = {
-  minSpeechMs: 500, // <0.5s 视为噪音
+const DEFAULT_OPTIONS: Omit<Required<VoiceDetectorOptions>, "onSegment" | "onSpeechStart"> = {
+  minSpeechMs: 350, // <0.35s 视为噪音（350ms：英语短词如 stop/yes/ok 约 0.3~0.6s，500ms 会把短词整段丢弃 → 识别不到/不准，2026-08-22 下调；噪音短段靠转写空丢弃兜底）
   maxSpeechMs: 15000, // 单句最长 15s（旧版 20s：越长 base64 越大，越易超 DashScope 上限）
   silenceMs: 1200, // 静音 1.2s 判定一句结束。
   // ⚠️ 英语学习者说英文时思考停顿多（um/ah/换词），0.9s 会把句子切碎成 2~3s 碎片，
@@ -68,7 +72,7 @@ const DEFAULT_OPTIONS: Omit<Required<VoiceDetectorOptions>, "onSegment"> = {
   thresholdFloor: 0.008, // 噪声地板下限（自适应抬升的基准）
   triggerRatio: 3.0, // 触发阈值 = max(噪声地板×3.0, 绝对下限 0.025)
   releaseRatio: 2.0, // 说话中低于 噪声地板×2.0 才开始计静音（迟滞，防抖动切段）
-  noiseAdaptRate: 0.002, // 噪声地板 EMA 速率（很慢，避免说话声污染噪声估计）
+  noiseAdaptRate: 0.004, // 噪声地板 EMA 速率（0.004：持续杂音环境数秒内抬升阈值，配合频谱判断抗杂音）
   preRollMs: 400, // 句首预卷 400ms（≈2 个切片）
   chunkMs: 250,
   maxIdleChunks: 20, // 空闲保留 5s 缓冲
@@ -86,6 +90,32 @@ const DEFAULT_OPTIONS: Omit<Required<VoiceDetectorOptions>, "onSegment"> = {
 const ABS_TRIGGER_FLOOR = 0.025;
 /** 绝对释放下限（低于它才算静音；与触发下限保持 ~36% 迟滞间距） */
 const ABS_RELEASE_FLOOR = 0.016;
+
+/**
+ * 强平坦噪声抑制阈值（2026-08-22 二次修复）：
+ * 频谱平坦度 > 此值 = 明显平坦的宽带噪声（白噪/空调/风扇/键盘），触发时拦下。
+ * 阈值取 0.75 宽松：只拦"铁定是噪声"的强平坦信号；0.5~0.75 中间地带放行——
+ * 上一版用 0.5 硬判据把真人说话也拦了（noiseSuppression 会把语音频谱压平，
+ * 平坦度常超 0.5 → 永不触发，实时对话完全无法识别）。
+ * 宁可偶尔误触发（转写空则丢弃=安全失败），不误杀真人。
+ * 平坦度 = 几何均值 / 算术均值（线性幅值），0~1，越接近 1 越平坦。
+ */
+const NOISE_FLATNESS_MIN = 0.75;
+/** 人声参考阈值（仅诊断日志 voice= 标记用；不再参与触发判断） */
+const VOICE_LOW_FLATNESS_MAX = 0.5;
+/** 人声主要频段上限对应的频点数量（fftSize=1024 → 512 频点；48kHz 下 85 点 ≈ 4kHz） */
+const VOICE_BAND_BINS = 85;
+
+/**
+ * barge-in 播放中触发阈值乘数（×1.6，2026-08-22）：
+ * TTS 外放时浏览器 AEC（echoCancellation）消不净的残余回声可能误触发 VAD，
+ * 导致"AI 自己打断自己"或把 TTS 内容当用户语音转写（识别错乱）。
+ * 播放中临时把触发阈值抬高 —— 用户近麦说话能量（通常 0.05+）仍可触发，
+ * AEC 残余回声（能量被衰减）不足以触发。
+ */
+const BARGE_IN_THRESHOLD_MULT = 1.6;
+/** barge-in 播放开头去抖时长：TTS 刚出声 300ms 内屏蔽 VAD 触发（防播报开头自打断） */
+const BARGE_IN_DEBOUNCE_MS = 300;
 
 /**
  * 麦克风约束：显式开启回声消除/降噪/自动增益 + 单声道。
@@ -134,8 +164,13 @@ function pickMimeType(): string {
 }
 
 export function useVoiceDetector(options: VoiceDetectorOptions = {}) {
-  // onSegment 由调用方注入（可选），默认缺省
-  const opts = { ...DEFAULT_OPTIONS, onSegment: undefined as VoiceDetectorOptions["onSegment"], ...options };
+  // onSegment / onSpeechStart 由调用方注入（可选），默认缺省
+  const opts = {
+    ...DEFAULT_OPTIONS,
+    onSegment: undefined as VoiceDetectorOptions["onSegment"],
+    onSpeechStart: undefined as VoiceDetectorOptions["onSpeechStart"],
+    ...options,
+  };
 
   const state = ref<VoiceState>("idle");
 
@@ -175,15 +210,23 @@ export function useVoiceDetector(options: VoiceDetectorOptions = {}) {
   let lowSignalWarned = false;
   /** 本次聆听开始时间（performance.now），用于弱信号自检 */
   let listeningSince = 0;
+  /** barge-in 播放中模式：TTS 外放期间触发阈值临时抬高 + 开头去抖（2026-08-22） */
+  let bargeInActive = false;
+  let bargeInStartAt = 0;
+  /** 频谱分析：低频段（0~4kHz）频谱平坦度（复用缓冲避免每帧分配） */
+  let freqBuf: Float32Array<ArrayBuffer> | null = null;
+  let lowBandFlatness = 1; // 1 = 完全平坦（纯噪声）；<0.5 = 谐波结构（像人声）
 
   /**
    * 触发/释放阈值：
    * - 触发（开始说话）= max(噪声地板×triggerRatio, 绝对下限 0.02)
    * - 释放（结束说话）= max(噪声地板×releaseRatio, 绝对下限 0.012)
    * 自适应保证嘈杂环境自动抬高防误触发；绝对下限保证安静环境不丢灵敏度。
+   * barge-in 播放中：触发阈值再 ×1.6，压住 AEC 未消净的 TTS 外放残余。
    */
   function triggerThreshold() {
-    return Math.max(noiseFloor * opts.triggerRatio, ABS_TRIGGER_FLOOR);
+    const base = Math.max(noiseFloor * opts.triggerRatio, ABS_TRIGGER_FLOOR);
+    return bargeInActive ? base * BARGE_IN_THRESHOLD_MULT : base;
   }
   function releaseThreshold() {
     return Math.max(noiseFloor * opts.releaseRatio, ABS_RELEASE_FLOOR);
@@ -275,6 +318,25 @@ export function useVoiceDetector(options: VoiceDetectorOptions = {}) {
     smoothedRms = smoothedRms === 0 ? rms : smoothedRms * 0.7 + rms * 0.3;
     if (rms > maxRmsSinceStart) maxRmsSinceStart = rms;
 
+    // 频谱特征（环境杂音区分，2026-08-22）：
+    // 低频段（0~4kHz）频谱平坦度 = 几何均值/算术均值。人声元音有谐波峰谷 → 平坦度低；
+    // 白噪/空调/风扇/点击声频谱平滑 → 平坦度高。每帧计算，开销 ~85 次幂运算可忽略。
+    if (!freqBuf) freqBuf = new Float32Array(analyser.frequencyBinCount);
+    analyser.getFloatFrequencyData(freqBuf);
+    let sumLin = 0;
+    let sumLog = 0;
+    for (let i = 1; i < VOICE_BAND_BINS && i < freqBuf.length; i++) {
+      const lin = Math.pow(10, freqBuf[i] / 20); // dB → 线性幅值
+      sumLin += lin;
+      sumLog += Math.log(lin + 1e-6);
+    }
+    lowBandFlatness =
+      sumLin > 0 && sumLog > 0 ? Math.exp(sumLog / (VOICE_BAND_BINS - 1)) / (sumLin / (VOICE_BAND_BINS - 1)) : 1;
+
+    // 是否"像人声"：低频段频谱有谐波结构（平坦度低于阈值）。
+    // 宽松判据只拦明显平坦的噪声，不误杀轻声说话。
+    const voiceLike = lowBandFlatness < VOICE_LOW_FLATNESS_MAX;
+
     // 诊断日志（节流 2s）：确认 VAD 是否真的收到音频 ——
     // 若 rms 恒为 0 说明 AudioContext/analyser 没数据（设备/挂起问题）；
     // 若 rms 明显高于 trigger 却无反应，说明切段回调链路有问题。
@@ -284,12 +346,15 @@ export function useVoiceDetector(options: VoiceDetectorOptions = {}) {
       console.debug(
         `[VAD] rms=${smoothedRms.toFixed(3)} trigger=${triggerThreshold().toFixed(3)} ` +
           `release=${releaseThreshold().toFixed(3)} noiseFloor=${noiseFloor.toFixed(3)} ` +
+          `flat=${lowBandFlatness.toFixed(2)} voice=${voiceLike ? 1 : 0} ` +
           `speaking=${speaking} chunks=${chunks.length}`,
       );
     }
     // 弱信号自检（一次性）：启动 5s 后若从未捕捉到接近阈值的能量，
-    // 提示麦克风音量/距离问题 —— 这正是"实时对话收不到语音"的常见根因
-    if (!lowSignalWarned && listeningSince > 0 && now - listeningSince > 5000 && maxRmsSinceStart < ABS_TRIGGER_FLOOR) {
+    // 提示麦克风音量/距离问题 —— 这正是"实时对话收不到语音"的常见根因。
+    // barge-in 播放中跳过：用户没说话是正常的，若 TTS 外放残余被 AEC 消得很干净，
+    // maxRms 恒低会误报"麦克风音量过低"。
+    if (!lowSignalWarned && !bargeInActive && listeningSince > 0 && now - listeningSince > 5000 && maxRmsSinceStart < ABS_TRIGGER_FLOOR) {
       lowSignalWarned = true;
       console.warn(
         `[VAD] 警告：5s 内最大能量 ${maxRmsSinceStart.toFixed(4)} 低于触发阈值 ` +
@@ -299,7 +364,14 @@ export function useVoiceDetector(options: VoiceDetectorOptions = {}) {
     }
 
     if (!speaking) {
-      if (smoothedRms > triggerThreshold()) {
+      // barge-in 去抖：TTS 刚播放的前 300ms 屏蔽触发——播报开头瞬间 AEC 还没
+      // 收敛，残余回声最易把 VAD 自己触发（"AI 自己打断自己"），去抖期内只学习噪声。
+      const inBargeInGuard = bargeInActive && now - bargeInStartAt < BARGE_IN_DEBOUNCE_MS;
+      // ⚠️ 触发 = 纯能量阈值（2026-08-22 频谱判断两轮误杀真人后回退）：
+      // 频谱平坦度只保留在诊断日志（flat=）供数据验证，不再参与触发判断——
+      // noiseSuppression 会把语音频谱压平，特征判据无法稳定区分，宁可用
+      // "能量阈值 + 转写空丢弃（安全失败）"兜底，也不误杀核心交互。
+      if (!inBargeInGuard && smoothedRms > triggerThreshold()) {
         // ── 说话起点：计算预卷起始索引（保留句首前几片，防句首被切）──
         // 起点从 index 1 起算（index 0 是 WebM 文件头片，由 doFlush 单独拼接）
         speaking = true;
@@ -307,6 +379,9 @@ export function useVoiceDetector(options: VoiceDetectorOptions = {}) {
         silenceStart = -1; // 未开始计静音
         const preRollChunks = Math.ceil(opts.preRollMs / opts.chunkMs);
         segmentStartChunk = Math.max(1, chunks.length - preRollChunks);
+        // barge-in 信号：用户开口瞬间立即通知调用方（TTS 播放中则打断播报，
+        // 停掉回声源后录音才干净；也避免等切段才处理导致用户声音与 TTS 外放混音）
+        opts.onSpeechStart?.();
       } else {
         // 空闲期：缓慢学习噪声地板（说话期间不更新，防说话声污染估计）
         noiseFloor = Math.max(
@@ -483,6 +558,36 @@ export function useVoiceDetector(options: VoiceDetectorOptions = {}) {
     rafId = requestAnimationFrame(analyze);
   }
 
+  /**
+   * 切换 barge-in 播放中模式（2026-08-22，由 chat.vue 在 TTS 播放开始/结束时调用）：
+   * - 开：触发阈值临时 ×1.6（压住 AEC 未消净的 TTS 外放残余，用户近麦说话仍可触发）
+   *       并记录开启时刻（analyze 里用 300ms 去抖屏蔽播报开头自触发）
+   * - 关：恢复正常灵敏度
+   */
+  function setBargeIn(on: boolean) {
+    bargeInActive = on;
+    if (on) bargeInStartAt = performance.now();
+  }
+
+  /**
+   * 打断重置当前段（barge-in 打断 TTS 后调用，2026-08-22）：
+   * 丢弃正在累积的段缓冲（含打断前录入的 TTS 外放回声），从当前重新起算。
+   * 用户继续说话会重新触发 trigger，切出的段只含用户声音 → 识别准确。
+   * 若打断是误触发（AEC 残余回声，用户没说话），重置后无声音 → 不会切段 → 无幻听。
+   */
+  function resetSegment() {
+    if (disposed) return;
+    speaking = false;
+    speechStartAt = 0; // 0 在弱信号自检处有 `|| now` 兜底；re-trigger 时会重置
+    silenceStart = -1;
+    segmentStartChunk = chunks.length; // 从当前起算（下次 trigger 会调回含 preRoll）
+    pendingFlush = false;
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = 0;
+    }
+  }
+
   /** 停止聆听并释放全部资源 */
   function stop() {
     disposed = true;
@@ -517,5 +622,5 @@ export function useVoiceDetector(options: VoiceDetectorOptions = {}) {
     state.value = "idle";
   }
 
-  return { state, start, pause, resume, stop };
+  return { state, start, pause, resume, stop, setBargeIn, resetSegment };
 }

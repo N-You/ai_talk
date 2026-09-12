@@ -60,9 +60,12 @@
               <span v-else>{{ seg.text }}</span>
             </template>
           </div>
-          <div class="message-actions" v-if="msg.role === 'assistant'">
-            <span class="action-btn" @click="playTts(msg.content)">🔊 播放</span>
-          </div>
+        </div>
+        <!-- 播放/停止操作：放在消息气泡右侧（仅 AI 消息），随气泡垂直居中 -->
+        <div class="message-actions" v-if="msg.role === 'assistant'">
+          <span class="action-btn" :class="{ playing: playingMsgId === msg.id }" @click="togglePlay(msg)">
+            {{ playingMsgId === msg.id ? "⏹" : "🔊" }}
+          </span>
         </div>
       </div>
 
@@ -170,8 +173,13 @@ import { ref, computed, onMounted, onUnmounted, nextTick, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { showToast, showSuccessToast } from "vant";
 import gsap from "gsap";
+import { Subject, interval, timer } from "rxjs";
+import type { Subscription } from "rxjs";
+import { takeUntil } from "rxjs/operators";
+import { webSocket, WebSocketSubject } from "rxjs/webSocket";
 import { conversationApi, learningApi, speechApi, userApi, getToken, WS_URL } from "@/api";
 import { useVoiceDetector } from "@/composables/useVoiceDetector";
+import { resolveAsrLang } from "@/config/languages";
 import iconMascotMini from "@/assets/icons/mascot-mini.svg";
 
 interface Message {
@@ -190,16 +198,27 @@ const messages = ref<Message[]>([]);
 const inputText = ref("");
 const isThinking = ref(false);
 const listRef = ref<HTMLDivElement | null>(null);
-const socket = ref<WebSocket | null>(null);
 const connected = ref(false);
 const reconnecting = ref(false);
-// 自动重连状态（指数退避）
-let reconnectTimer: number | null = null;
+
+// ── WS 连接（RxJS 管理：事件流 + 心跳 + 重连 + 统一清理，防内存泄漏）──
+/** 连接代际：每次 connectSocket +1，旧连接的回调（open/close/心跳）据此失效，杜绝串扰 */
+let wsGen = 0;
+let wsSubject: WebSocketSubject<any> | null = null;
+/** 指数退避重连计数（连接成功/主动清理时归零） */
 let reconnectAttempts = 0;
-// 心跳检测（应用层 ping + 假死兜底）
-let heartbeatTimer: number | null = null;
-let staleCheckTimer: number | null = null;
+/** 重连定时器订阅（RxJS timer，随 destroy$ 自动清理） */
+let reconnectTimerSub: Subscription | null = null;
+/** 心跳参数：25s 发 ping；60s 无任何消息视为假死，强制重连 */
+const PING_INTERVAL_MS = 25_000;
+const STALE_TIMEOUT_MS = 60_000;
 let lastMsgAt = 0;
+/** 页面是否已卸载（卸载后禁止任何重连/副作用） */
+let destroyed = false;
+/** 页面卸载信号：全部订阅 takeUntil(destroy$)，卸载即自动取消订阅（RxJS 防泄漏核心） */
+const destroy$ = new Subject<void>();
+/** 显式收集的活动订阅（消息/心跳/假死检测），替换连接时先整体取消 */
+const wsSubs: Subscription[] = [];
 
 // 单词释义弹窗状态（点击消息中的单词触发）
 const showWordModal = ref(false);
@@ -233,10 +252,14 @@ const liveStatusText = computed(() => {
 // - 触发阈值自适应噪声地板（triggerRatio=4），环境音不再误触发
 // - 预卷 400ms + 句尾取尾补齐，解决句首/句尾被切（接收不全）
 const voiceDetector = useVoiceDetector({
-  minSpeechMs: 500, // <0.5s 视为噪音
+  minSpeechMs: 350, // <0.35s 视为噪音（英语短词 stop/yes/ok 约 0.3~0.6s，500ms 会把短词整段丢弃 → 识别不到/不准）
   maxSpeechMs: 15000, // 单句最长 15s（受 DashScope base64 10MB 上限约束）
   silenceMs: 1200, // 静音 1.2s 判定一句结束（英文学习者思考停顿多，0.9s 会把句子切碎）
   onSegment: (blob, mimeType) => handleLiveSegment(blob, mimeType),
+  // barge-in（2026-08-22）：TTS 播放中 VAD 保持聆听，用户一开口立即打断播报。
+  // 打断后回声源消失，用户后半句录音干净；误触发（AEC 未消净的 TTS 回声）时
+  // 只会打断播报、不会产生幻听消息（转写为空则丢弃）——"安全失败"。
+  onSpeechStart: () => handleBargeIn(),
 });
 
 /** 切换对话模式：停止另一模式的进行中活动 */
@@ -279,15 +302,37 @@ function stopLive() {
 }
 
 /** VAD 切段回调：转写该段并自动发送（无感闭环） */
+/**
+ * barge-in 打断（2026-08-22）：VAD 检测到用户开口（onSpeechStart）时调用。
+ * 若 TTS 正在播放 → 立即停掉播报（stopTts：停 audio + 复位 ttsPlaying + 恢复聆听）。
+ * 回声源消失后，用户后半句录音干净，切段后正常进入对话 —— 实现"边说边打断 AI"。
+ * 若没在播放 → 无操作（正常聆听路径，不影响切段）。
+ * 误触发（AEC 未消净的 TTS 回声）时：只打断播报、不会产生幻听消息
+ * （后续转写为空则丢弃）——"安全失败"，宁可少播不可乱发。
+ */
+function handleBargeIn() {
+  if (ttsPlaying.value) {
+    console.debug("[chat] barge-in：检测到说话，打断 TTS 播报");
+    stopTts(); // 停 TTS + 复位 ttsPlaying + 退出 barge-in 模式
+    // 丢弃打断前已录入的段缓冲（含 TTS 外放回声）——否则用户后半句转写
+    // 会混入 AI 刚说的话，识别不准确。重置后用户继续说话重新起算，段只含人声。
+    voiceDetector.resetSegment();
+  }
+}
+
 async function handleLiveSegment(blob: Blob, mimeType: string) {
   // 丢弃原因都打日志，方便排查"收不到语音"：
   // - liveTranscribing=true：上一段还在转写中（含 60s 超时+重试，最长达分钟级），当前段被挤掉
+  // - ttsPlaying=true：TTS 正在外放，本段极可能是扬声器回声（防幻听第三层）
   // - isThinking=true：AI 回复中（正常），但若回复状态卡死也会静默丢段
   // - !liveStarted：聆听已停止（正常）
   if (liveTranscribing.value) {
     console.debug("[chat] live 段被丢弃：上一段仍在转写中");
     return;
   }
+  // 注：不再有 ttsPlaying 丢弃分支（2026-08-22 barge-in 改造）——
+  // 播放中用户开口由 onSpeechStart → handleBargeIn 先停 TTS，本段已是干净的用户声音；
+  // 若播放中无人说话，VAD 不会切段（TTS 外放由浏览器 AEC 消掉，残余不足以触发）。
   if (isThinking.value) {
     console.debug("[chat] live 段被丢弃：AI 正在回复中 (isThinking=true)");
     return;
@@ -296,13 +341,14 @@ async function handleLiveSegment(blob: Blob, mimeType: string) {
   liveTranscribing.value = true;
   console.debug(`[chat] live 段转写开始 blob=${blob.size}B mime=${mimeType}`);
   try {
-    const res = await speechApi.transcribe({ file: blob, mimeType });
+    // 传入用户配置的识别语言（如 "en"）：显式语言提示可显著改善英文识别（压掉中文母语先验）
+    const res = await speechApi.transcribe({ file: blob, mimeType }, resolveAsrLang(recogLang.value));
     const text = (res?.text ?? "").trim();
     if (!text) return; // 空识别直接忽略，继续聆听
     if (isThinking.value) return; // AI 正在回复，丢弃本次输入
     // 无感发送：不进输入框，直接走 WS。
     // 注意：未连接判断必须在 push 之前，旧代码在这里 pop() 会误删上一条 AI 消息。
-    if (!connected.value || !socket.value) {
+    if (!sendWs({ event: "text", data: { conversation_id: conversationId.value, content: text } })) {
       showToast("连接已断开，请重试");
       return;
     }
@@ -312,9 +358,6 @@ async function handleLiveSegment(blob: Blob, mimeType: string) {
     // AI 回复期间暂停聆听，防止录到 TTS 回声
     voiceDetector.pause();
     scrollToBottom();
-    socket.value.send(
-      JSON.stringify({ event: "text", data: { conversation_id: conversationId.value, content: text } }),
-    );
   } catch (e: any) {
     console.error("[chat] live transcribe error", e);
     showToast(e?.message || "语音识别失败");
@@ -324,44 +367,78 @@ async function handleLiveSegment(blob: Blob, mimeType: string) {
 }
 
 /**
- * AI 回复完成后恢复聆听（live 模式）；若 TTS 在播则等播完，防回声录入。
- * 超时兜底（2026-08-16 二次修复）：**不再停掉 TTS**（用户反馈长文本朗读被 8s 截断），
- * 改为把 TTS 音量降到 0.25 后恢复聆听 —— TTS 完整播完，回声被压到很弱；
- * 若用户此时说话，微弱回声对 ASR 影响小。TTS 播完(ended) 后音量由下次 playTts 重置。
- */
-/**
- * AI 回复播完后恢复聆听（防回声关键）：
- * - 优先监听播放进度 timeupdate：剩余 <0.6s 即恢复——长句尾部不再被 8s 定时器"一刀切"，
- *   既不把 TTS 尾部录进下一段，也不让用户等 TTS 完全播完才开口
- * - 兜底：8s 超时降音量 0.25 后恢复（timeupdate 不触发 / 播放卡死时保底，不截断 TTS）
+ * 播放收尾处理（live 模式，2026-08-22 barge-in 改造后）：
+ * - barge-in 模式下 VAD 播放中保持聆听（playTts 播放开始已 resume），
+ *   本函数主要负责：播放结束/停止时的**状态清理**（playingMsgId/ttsPlaying/定时器/监听）
+ * - 恢复聆听时机：① ended 真正触发（等 TTS 自然播完，不再提前静音——曾导致
+ *   "最后 0.6s 突然无声"体验差，2026-08-22 废弃尾音提前恢复）；② 播放卡死检测
+ *   （currentTime 连续 3s 停滞才恢复，长文本正常播放不会再被打断，只有真卡死才兜底，
+ *   防 VAD 永不恢复）
+ * - token 绑定：旧播放（被停止/被新播放覆盖）的恢复回调一律失效，防串扰
  */
 function resumeLiveAfterReply() {
   if (mode.value !== "live" || !liveStarted.value) return;
+  const token = ttsToken; // 绑定本次播放令牌：被新播放/停止覆盖后，旧回调全部失效
   const resumeNow = () => {
     if (ttsTailTimer !== null) {
       clearTimeout(ttsTailTimer);
       ttsTailTimer = null;
     }
-    audioEl?.removeEventListener("timeupdate", onTime);
     audioEl?.removeEventListener("ended", onEnded);
+    if (token !== ttsToken) return; // 已被新播放/停止覆盖：本次恢复作废
+    playingMsgId.value = null; // 播放结束/停止：清除"正在播放"标记
+    ttsPlaying.value = false; // 音频不再出声，守卫解除
+    voiceDetector.setBargeIn(false); // 恢复正常灵敏度（播放结束/卡死兜底恢复时）
+    // 仅当 TTS 此刻仍在出声（卡死兜底 / 停止后的异常残留）才静音——0 音量物理上
+    // 无法被麦克风捕获，防残留外放触发 VAD 幻听。正常 ended 路径 audioEl.ended=true
+    // 不会执行，播放完整播完——不再有"最后 0.6s 突然无声"的体验问题（2026-08-22）。
+    if (audioEl && !audioEl.paused && !audioEl.ended) audioEl.volume = 0;
     voiceDetector.resume();
   };
-  function onTime() {
-    if (audioEl && audioEl.duration > 0 && audioEl.duration - audioEl.currentTime < 0.6) resumeNow();
-  }
+  // 尾音提前恢复已废弃（2026-08-22）：曾监听 timeupdate 剩 <0.6s 即静音+恢复聆听，
+  // 导致每段播放结尾"突然停止"（用户反馈体验差）。现在等 ended 自然播完再收尾。
   function onEnded() {
+    if (token !== ttsToken) return;
     resumeNow();
   }
   if (audioEl && !audioEl.paused && !audioEl.ended) {
-    audioEl.addEventListener("timeupdate", onTime);
     audioEl.addEventListener("ended", onEnded, { once: true });
-    ttsTailTimer = window.setTimeout(() => {
-      // 超时兜底：不截断 TTS，只降音量 + 恢复聆听（防 play() 卡死导致永不恢复）
-      if (audioEl && !audioEl.paused && !audioEl.ended) audioEl.volume = 0.25;
-      resumeNow();
-    }, 8000);
+    // 卡死检测：每 1s 检查一次 currentTime，连续 3 次（3s）无推进且未 ended
+    // → 判定播放卡死（play() 被拒/音频源卡住），恢复聆听兜底。
+    // 替代旧版"8s 定时恢复"：长文本正常播放（>8s）不再被打断，只有真卡死才恢复。
+    let lastPos = audioEl.currentTime;
+    let stallCount = 0;
+    const checkStall = () => {
+      if (token !== ttsToken) return;
+      if (!audioEl) {
+        resumeNow();
+        return;
+      }
+      if (audioEl.ended || audioEl.paused) {
+        resumeNow();
+        return;
+      }
+      const pos = audioEl.currentTime;
+      if (pos === lastPos) {
+        stallCount++;
+        if (stallCount >= 3) {
+          console.warn("[chat] tts 播放停滞，恢复聆听兜底");
+          resumeNow();
+          return;
+        }
+      } else {
+        stallCount = 0;
+        lastPos = pos;
+      }
+      ttsTailTimer = window.setTimeout(checkStall, 1000);
+    };
+    ttsTailTimer = window.setTimeout(checkStall, 1000);
   } else {
-    window.setTimeout(resumeNow, 700);
+    // 没有正在播放的音频（合成失败/已停止等）：短暂延迟后恢复
+    window.setTimeout(() => {
+      if (token !== ttsToken) return;
+      resumeNow();
+    }, 700);
   }
 }
 
@@ -383,23 +460,29 @@ function onScroll() {
 }
 
 onMounted(() => {
-  loadUserSpeed(); // 拉取用户语速设置（TTS 朗读用）
+  loadUserSettings(); // 拉取用户语音设置（语速 + 识别语言）
   initConversation();
 });
 
 onUnmounted(() => {
+  // RxJS 生命周期收尾：置 destroyed 拦截一切重连副作用，destroy$ complete 让所有
+  // takeUntil(destroy$) 的订阅（消息/心跳/假死/重连）自动取消 —— 防内存泄漏核心
+  destroyed = true;
+  destroy$.next();
+  destroy$.complete();
   cleanupSocket();
   voiceDetector.stop();
-  releaseAudio();
+  stopTts(); // 停止播放并释放音频，避免离开页面后还在响
 });
 
-/** 拉取用户语速设置（settings.speed，0.5~1.5），TTS 自动朗读/点词发音共用；失败静默保持默认 1 */
-async function loadUserSpeed() {
+/** 拉取用户语音设置（settings：语速 speed + 识别语言 language），进入页面时调用；失败静默用默认 */
+async function loadUserSettings() {
   try {
     const s = await userApi.getSettings();
     if (typeof s.speed === "number") ttsSpeed.value = Math.min(1.5, Math.max(0.5, s.speed));
+    if (typeof s.language === "string") recogLang.value = s.language;
   } catch {
-    /* 未登录 / 接口异常时用默认语速 */
+    /* 未登录 / 接口异常时用默认值 */
   }
 }
 
@@ -407,20 +490,28 @@ async function loadUserSpeed() {
  * 1. query 携带 conversationId（首页"继续练习"）→ 恢复已有会话：拉历史消息渲染，直接 join 继续对话
  * 2. 否则（场景库/今日生词入口）→ 创建新会话 → join
  */
-async function initConversation() {  const resumeId = Number(route.query.conversationId) || 0;
+async function initConversation() {
+  const resumeId = Number(route.query.conversationId) || 0;
   try {
     if (resumeId) {
-      // 恢复模式：detail 返回会话 + 历史消息 + 场景
-      const conv = await conversationApi.detail(resumeId);
-      conversationId.value = conv.id;
-      if (conv.scenario?.name) scenarioName.value = conv.scenario.name;
-      // 历史消息按时间正序渲染（主键自增即创建顺序）
-      messages.value = (conv.messages ?? [])
-        .filter((m: any) => m.role === "user" || m.role === "assistant")
-        .map((m: any) => ({ id: m.id, role: m.role, content: m.content }));
-      connectSocket();
-      nextTick(scrollToBottom); // 恢复后滚动到底部，看到上次最后一条消息
-      return;
+      try {
+        // 恢复模式：detail 返回会话 + 历史消息 + 场景
+        const conv = await conversationApi.detail(resumeId);
+        conversationId.value = conv.id;
+        if (conv.scenario?.name) scenarioName.value = conv.scenario.name;
+        // 历史消息按时间正序渲染（主键自增即创建顺序）
+        messages.value = (conv.messages ?? [])
+          .filter((m: any) => m.role === "user" || m.role === "assistant")
+          .map((m: any) => ({ id: m.id, role: m.role, content: m.content }));
+        connectSocket();
+        nextTick(scrollToBottom); // 恢复后滚动到底部，看到上次最后一条消息
+        return;
+      } catch {
+        // 会话已被删除（404）：降级为新会话，全新上下文（2026-08-22）。
+        // 首页删除后若仍带着旧 conversationId 进入，不应报"初始化失败"，
+        // 而应视为"清空上下文重新开始"——直接开一个新会话。
+        console.warn("[chat] 恢复会话失败（可能已删除），降级为新会话");
+      }
     }
     const conv = await conversationApi.create(scenarioId.value);
     conversationId.value = conv.id;
@@ -431,11 +522,17 @@ async function initConversation() {  const resumeId = Number(route.query.convers
 }
 
 /**
- * 建立原生 WebSocket 连接（/ws/conversations?token=...），带完整连接健壮性：
- * - 自动重连：断线后指数退避（1s 起、封顶 30s、加抖动），成功后自动重新 join 恢复会话
- * - 心跳检测：25s 发应用层 ping（服务端回 pong）；60s 内收不到任何消息判定假死，主动断开触发重连
- *   （服务端另有协议级 ping/pong 心跳，30s 内无响应会被服务端 terminate）
- * - onopen → join；onmessage → 分发 handleWSMessage
+ * 建立 WebSocket 连接（RxJS WebSocketSubject 管理，/ws/conversations?token=...）。
+ *
+ * RxJS 化的收益（2026-08-22）：
+ * - 事件流（open/close/message）+ 定时器（心跳/假死/重连）统一为可组合流
+ * - 所有订阅 takeUntil(destroy$)：页面卸载即自动取消，杜绝定时器/订阅泄漏
+ * - 连接"代际"（wsGen）让旧连接回调全部失效，替换连接零串扰
+ *
+ * 事件语义（与 WebSocketSubject 对应）：
+ * - openObserver → 连接建立：发 join + 重置重连计数 + 状态复位
+ * - closeObserver → 连接关闭（主动/异常都到这）：复位 AI 状态 + 计划重连
+ *   （主动替换/卸载由 wsGen / destroyed 拦截，不触发重连）
  */
 function connectSocket() {
   const token = getToken();
@@ -445,116 +542,122 @@ function connectSocket() {
     return;
   }
 
-  // 防止重复连接：旧连接先摘除 onclose 并关闭（不触发重连）
-  if (socket.value) {
-    socket.value.onclose = null;
-    socket.value.close();
-  }
+  const gen = ++wsGen; // 新一代连接：旧连接的一切回调随之失效
+  disposeWsSubs(); // 先取消旧连接的活动订阅（消息/心跳/假死/重连）
 
   const url = `${WS_URL}/ws/conversations?token=${encodeURIComponent(token)}`;
-  const ws = new WebSocket(url);
-  socket.value = ws;
   lastMsgAt = Date.now();
 
-  ws.onopen = () => {
-    connected.value = true;
-    reconnecting.value = false;
-    reconnectAttempts = 0; // 连接成功，重置退避步数
-    ws.send(JSON.stringify({ event: "join", data: { conversation_id: conversationId.value } }));
-    startHeartbeat();
-  };
+  wsSubject = webSocket<any>({
+    url,
+    openObserver: {
+      next: () => {
+        if (gen !== wsGen || destroyed) return; // 旧连接/已卸载，忽略
+        connected.value = true;
+        reconnecting.value = false;
+        reconnectAttempts = 0; // 连接成功，重置退避步数
+        wsSubject?.next({ event: "join", data: { conversation_id: conversationId.value } });
+      },
+    },
+    closeObserver: {
+      next: () => {
+        if (gen !== wsGen || destroyed) return; // 旧连接/已卸载，不触发重连
+        connected.value = false;
+        // 关键修复（2026-08-16）：断线复位 AI 回复状态，
+        // 否则 isThinking 卡 true 会静默丢弃所有后续语音段
+        isThinking.value = false;
+        streaming.value = false;
+        liveTranscribing.value = false;
+        if (mode.value === "live" && liveStarted.value) voiceDetector.resume();
+        scheduleReconnect(gen); // 指数退避重连
+      },
+    },
+  });
 
-  ws.onmessage = (e) => {
-    lastMsgAt = Date.now(); // 任何消息都算"连接存活"
-    let payload: any;
-    try {
-      payload = JSON.parse(e.data);
-    } catch (err) {
-      console.error("[chat] bad message", err, e.data);
-      return;
-    }
-    // 应用层 pong 仅用于假死兜底，无需分发 UI
-    if (payload.event === "pong") return;
-    handleWSMessage(payload);
-  };
+  // 消息流 → handleWSMessage（pong 仅用于假死兜底，不分发 UI）
+  const msgSub = wsSubject.pipe(takeUntil(destroy$)).subscribe({
+    next: (raw: any) => {
+      lastMsgAt = Date.now(); // 任何消息都算"连接存活"
+      let payload: any;
+      try {
+        payload = typeof raw === "string" ? JSON.parse(raw) : raw;
+      } catch (err) {
+        console.error("[chat] bad message", err, raw);
+        return;
+      }
+      if (payload?.event === "pong") return;
+      handleWSMessage(payload);
+    },
+    error: (err) => console.error("[chat] ws error", err),
+  });
 
-  ws.onclose = () => {
-    connected.value = false;
-    stopHeartbeat();
-    // 关键修复（2026-08-16）：连接断开时复位 AI 回复状态。
-    // 否则 isThinking 卡 true → handleLiveSegment 守卫 `if (isThinking.value) return`
-    // 会静默丢弃所有后续语音段 → "实时对话收不到语音"。
-    isThinking.value = false;
-    streaming.value = false;
-    liveTranscribing.value = false;
-    if (mode.value === "live" && liveStarted.value) voiceDetector.resume();
-    scheduleReconnect();
-  };
+  // 心跳：25s 定时 ping（保持连接活跃）
+  const pingSub = interval(PING_INTERVAL_MS).pipe(takeUntil(destroy$)).subscribe(() => {
+    if (gen !== wsGen || destroyed) return;
+    if (wsSubject && connected.value) wsSubject.next({ event: "ping" });
+  });
 
-  ws.onerror = (e) => {
-    // onerror 后必然触发 onclose（由 onclose 统一处理复位 + 重连）
-    console.error("[chat] socket error", e);
-  };
-}
-
-/** 启动应用层心跳：定时 ping + 假死检测 */
-function startHeartbeat() {
-  stopHeartbeat();
-  const PING_INTERVAL_MS = 25_000;
-  const STALE_TIMEOUT_MS = 60_000;
-  heartbeatTimer = window.setInterval(() => {
-    if (socket.value && socket.value.readyState === WebSocket.OPEN) {
-      socket.value.send(JSON.stringify({ event: "ping" }));
-    }
-  }, PING_INTERVAL_MS);
-  staleCheckTimer = window.setInterval(() => {
-    if (socket.value && socket.value.readyState === WebSocket.OPEN && Date.now() - lastMsgAt > STALE_TIMEOUT_MS) {
+  // 假死检测：60s 无任何消息 → 主动关闭触发 closeObserver → 重连
+  const staleSub = interval(5_000).pipe(takeUntil(destroy$)).subscribe(() => {
+    if (gen !== wsGen || destroyed) return;
+    if (connected.value && Date.now() - lastMsgAt > STALE_TIMEOUT_MS) {
       console.warn("[chat] heartbeat stale, force reconnect");
-      socket.value.close(); // 触发 onclose → scheduleReconnect
+      wsSubject?.complete(); // 触发 closeObserver（gen 未变 → 走重连）
     }
-  }, 5_000);
+  });
+
+  wsSubs.push(msgSub, pingSub, staleSub);
 }
 
-/** 停止心跳定时器（连接断开/页面卸载时） */
-function stopHeartbeat() {
-  if (heartbeatTimer !== null) {
-    clearInterval(heartbeatTimer);
-    heartbeatTimer = null;
-  }
-  if (staleCheckTimer !== null) {
-    clearInterval(staleCheckTimer);
-    staleCheckTimer = null;
-  }
+/** 统一发送：连接可用才发，返回是否成功（替代原 socket.value.send） */
+function sendWs(payload: any): boolean {
+  if (!wsSubject || !connected.value) return false;
+  wsSubject.next(payload);
+  return true;
 }
 
-/** 指数退避自动重连：1s×2^n 封顶 30s，加 ±30% 抖动避免并发踩踏 */
-function scheduleReconnect() {
-  if (reconnectTimer !== null) return; // 已有重连计划在排队
+/** 指数退避自动重连：1s×2^n 封顶 30s，加 ±30% 抖动；RxJS timer 管理（随 destroy$ 清理） */
+function scheduleReconnect(gen: number) {
+  if (destroyed || gen !== wsGen) return; // 已卸载 / 已有新连接
+  if (reconnectTimerSub) reconnectTimerSub.unsubscribe(); // 防重复排队
   reconnecting.value = true;
-  const MAX_RECONNECT_DELAY = 30_000;
-  const delay = Math.min(1000 * 2 ** reconnectAttempts, MAX_RECONNECT_DELAY) * (0.7 + Math.random() * 0.6);
+  const delay = Math.min(1000 * 2 ** reconnectAttempts, 30_000) * (0.7 + Math.random() * 0.6);
   reconnectAttempts++;
   console.warn(`[chat] ws closed, reconnect in ${Math.round(delay)}ms (attempt ${reconnectAttempts})`);
-  reconnectTimer = window.setTimeout(() => {
-    reconnectTimer = null;
-    connectSocket();
-  }, delay);
+  reconnectTimerSub = timer(delay)
+    .pipe(takeUntil(destroy$))
+    .subscribe(() => {
+      reconnectTimerSub = null;
+      if (destroyed) return;
+      connectSocket(); // 新一代 gen 自动 +1
+    });
 }
 
-/** 彻底清理连接（页面卸载/结束会话）：取消重连与心跳，关闭连接 */
+/** 取消当前连接的全部活动订阅（替换连接/清理时调用） */
+function disposeWsSubs() {
+  for (const s of wsSubs) s.unsubscribe();
+  wsSubs.length = 0;
+  if (reconnectTimerSub) {
+    reconnectTimerSub.unsubscribe();
+    reconnectTimerSub = null;
+  }
+}
+
+/** 主动断开并清理（结束会话/页面卸载）：不触发重连 */
 function cleanupSocket() {
-  if (reconnectTimer !== null) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-  reconnectAttempts = 0;
+  wsGen++; // 令所有旧回调（open/close/心跳）失效
   reconnecting.value = false;
-  stopHeartbeat();
-  if (socket.value) {
-    socket.value.onclose = null; // 手动关闭，不触发重连
-    socket.value.close();
-    socket.value = null;
+  reconnectAttempts = 0;
+  disposeWsSubs();
+  if (wsSubject) {
+    try {
+      wsSubject.complete(); // 关闭底层连接；closeObserver 因 wsGen 已变被忽略
+    } catch {
+      /* ignore */
+    }
+    wsSubject = null;
   }
+  connected.value = false;
 }
 
 /**
@@ -602,9 +705,13 @@ function handleWSMessage(payload: any) {
     streaming.value = false;
     isThinking.value = false;
     scrollToBottom();
-    if (full) playTts(full);
-    // live 模式：AI 回完自动恢复聆听（等 TTS 播完防回声）
-    resumeLiveAfterReply();
+    // 自动朗读：绑定消息 id 便于显示"停止"。playTts 内部已完整负责
+    // "暂停 VAD → 合成 → 播放 → 播完/停止后恢复聆听"，**此处绝不能再调
+    // resumeLiveAfterReply()**——它是同步执行而 playTts 在 await 合成处挂起，
+    // 会导致：① 700ms 后提前恢复 VAD，TTS 外放被录进麦克风 → 幻听；
+    // ② playingMsgId 被提前清空，停止按钮变回 🔊，播放中无法点停（2026-08-22 事故）。
+    if (full) playTts(full, last?.id);
+    else resumeLiveAfterReply(); // 没有内容可播：直接恢复聆听
   } else if (event === "ai_error") {
     streaming.value = false;
     isThinking.value = false;
@@ -635,19 +742,14 @@ async function sendText() {
   streaming.value = false;
   scrollToBottom();
 
-  if (!connected.value || !socket.value) {
+  if (!sendWs({ event: "text", data: { conversation_id: conversationId.value, content: text } })) {
     isThinking.value = false;
     messages.value.push({
       id: Date.now() + 1,
       role: "assistant",
       content: "连接未建立，请确认已登录且后端已启动",
     });
-    return;
   }
-
-  socket.value.send(
-    JSON.stringify({ event: "text", data: { conversation_id: conversationId.value, content: text } }),
-  );
 }
 
 // ── 录音（MediaRecorder）──
@@ -788,7 +890,8 @@ function stopRecord() {
 async function doTranscribe(input: { filePath?: string; file?: Blob; mimeType?: string }) {
   recognizing.value = true;
   try {
-    const res = await speechApi.transcribe(input);
+    // 传入用户配置的识别语言（同 live 模式，见 handleLiveSegment）
+    const res = await speechApi.transcribe(input, resolveAsrLang(recogLang.value));
     const text = (res?.text ?? "").trim();
     if (!text) {
       showToast("没听清，请再说一次");
@@ -854,6 +957,14 @@ async function addWordToLibrary() {
 const MAX_AUTO_TTS_LEN = 300;
 /** 用户设置的 AI 语速（settings.speed，0.5~1.5，默认 1；进入页面时拉取） */
 const ttsSpeed = ref(1);
+/**
+ * 识别语言（settings.language，见 config/languages.ts）。
+ * 默认 "auto"（2026-08-22 修复）：中英混说是中文母语学习者的常态，
+ * 强制 language=en 会把中文"听译"成英文；后端已用 language_hints=["en","zh"]
+ * （候选语种提示）兼顾"短英文词"与"中文"，比强制单语种更平衡。
+ * 纯单语种场景可在「我的」页切 en/zh 强制提升。
+ */
+const recogLang = ref("auto");
 /** TTS 结果内存缓存（key=voice:speed:text → Blob）：重听/点词重复朗读不再重复合成，省调用省额度 */
 const ttsCache = new Map<string, Blob>();
 const TTS_CACHE_MAX = 50;
@@ -872,6 +983,28 @@ async function cachedSynthesize(text: string, voice?: string): Promise<Blob> {
   return blob;
 }
 
+/** 正在播放的消息 id（用于"播放/停止"按钮切换与高亮；null=未播放） */
+const playingMsgId = ref<number | null>(null);
+
+/**
+ * TTS 是否正在播放（防幻听第三层守卫，2026-08-22）：
+ * handleLiveSegment 切段转写前先查它——TTS 出声期间切出的段极可能是
+ * 外放回声（尤其外放+近麦环境），一律丢弃，不进入转写/发送链路。
+ * 与 isThinking 守卫的区别：isThinking 是"AI 回复中"（含流式阶段），
+ * ttsPlaying 是"音频正在外放"（播放/合成完成的播放阶段）。
+ * ⚠️ 不做"内容比对"：跟读（英语学习核心交互）与回声在文本上不可区分，
+ * 都是"AI 说过的话"，比对会误杀跟读（2026-08-22 事故，已废弃）。
+ */
+const ttsPlaying = ref(false);
+
+/**
+ * TTS 播放令牌：解决"合成中停止失效"的竞态（2026-08-22）。
+ * playTts 是异步的（await 合成），期间点停止/再点播放——
+ * 若没有令牌，旧 playTts 在合成完成后仍会把音频播出来（"点了停还在播"）。
+ * 令牌自增 = 作废所有更早的进行中播放；await 后检查令牌是否仍是最新。
+ */
+let ttsToken = 0;
+
 /** 恢复聆听的 8s 兜底定时器（页面卸载/释放音频时清理） */
 let ttsTailTimer: number | null = null;
 
@@ -888,31 +1021,68 @@ function releaseAudio() {
 
 /**
  * 播放 TTS（自动朗读 / 手动点 🔊）。
- * 防回声关键（2026-08-16）：播放前若 live 模式在聆听，先暂停 VAD/录音——
- * 否则外放 TTS 会被麦克风录进下一段，ASR 把 TTS 内容与用户声音混在一起识别，
- * 出现"词义丢失/错误识别"。播放结束/失败后由 resumeLiveAfterReply 恢复聆听。
+ * 防回声/防幻听（2026-08-16 ~ 08-22 演进）：
+ * - 早期：播放前暂停聆听、播完恢复（"要么听 AI 说，要么听你说"）
+ * - 现在（barge-in）：**播放中 VAD 保持聆听**，用户一开口由 onSpeechStart →
+ *   handleBargeIn 立即停 TTS（回声源消失，录音干净），后续切段正常进入对话。
+ *   这同时是"防幻听"的主动式方案：任何 VAD 触发都会先停掉回声源。
+ * msgId 可选：绑定"正在播放哪条消息"，用于切换 停止/播放 按钮。
  */
-async function playTts(text: string) {
+async function playTts(text: string, msgId?: number) {
   if (!text) return;
   if (text.length > MAX_AUTO_TTS_LEN) return;
-  // 播放前：live 模式先暂停聆听（TTS 播完再恢复），防回声入麦
-  if (mode.value === "live" && liveStarted.value) voiceDetector.pause();
+  const token = ++ttsToken; // 本次播放令牌
+  playingMsgId.value = msgId ?? null;
   try {
     const blob = await cachedSynthesize(text);
+    if (token !== ttsToken) return; // 播放已被停止/被新播放覆盖：放弃本次
     releaseAudio();
     audioUrl = URL.createObjectURL(blob);
     if (!audioEl) audioEl = new Audio();
     audioEl.src = audioUrl;
     audioEl.volume = 0.7; // 轻微降低外放音量，减小回声能量（不影响听感）
+    // 播放开始：置位"TTS 出声中"守卫 + 进入 barge-in 模式
+    // （VAD 阈值×1.6 压住 AEC 残余回声防自打断；用户近麦说话仍可触发）
+    ttsPlaying.value = true;
     audioEl.play().catch(() => {});
-    // 播完/超时后恢复聆听（见 resumeLiveAfterReply：播放进度优先，8s 降音量兜底）
+    if (mode.value === "live" && liveStarted.value) {
+      // barge-in 关键：播放开始立即恢复聆听（AI 回复期间 pause 的 VAD 此刻解除）——
+      // 否则 VAD 一直暂停，用户开口 onSpeechStart 永远不会触发，打断失效
+      voiceDetector.setBargeIn(true);
+      voiceDetector.resume();
+    }
+    // 播完/超时后收尾（见 resumeLiveAfterReply：进度优先，卡死检测兜底）
     resumeLiveAfterReply();
   } catch (e: any) {
+    if (token !== ttsToken) return; // 旧播放的失败，忽略（已被停止/覆盖）
     console.error("[chat] tts error", e);
     showToast(e?.message || "语音朗读失败");
+    playingMsgId.value = null;
     // 合成失败：没有 TTS 播放，恢复聆听
     resumeLiveAfterReply();
   }
+}
+
+/**
+ * 停止播放（⏹ 按钮 / 离开页面）：
+ * - ttsToken 自增：作废进行中的 playTts（合成完成后不会再播出来）
+ * - 暂停 audio + 释放 URL（缓存保留：重播命中缓存，不重复合成 → 省 TTS 额度）
+ * - 恢复聆听（若 live 模式因播放暂停了 VAD —— 防回声状态机闭环，否则停止后麦克风一直"失聪"）
+ */
+function stopTts() {
+  ttsToken++; // 作废进行中的播放
+  ttsPlaying.value = false; // 音频停止出声，解除"TTS 播放中"守卫
+  if (mode.value === "live" && liveStarted.value) voiceDetector.setBargeIn(false); // 恢复正常灵敏度
+  if (audioEl && !audioEl.paused) audioEl.pause();
+  releaseAudio();
+  playingMsgId.value = null;
+  resumeLiveAfterReply();
+}
+
+/** 播放/停止切换：正在播这条 → 停止；否则播放这条 */
+function togglePlay(msg: Message) {
+  if (playingMsgId.value === msg.id) stopTts();
+  else playTts(msg.content, msg.id);
 }
 
 /** 结束会话：停聆听 → 断开 WS（含取消重连/心跳）→ 调 end 接口记录 → 返回上一页 */
@@ -1099,6 +1269,7 @@ function goBack() {
 
 .message-ai {
   flex-direction: row;
+  align-items: center; /* 气泡右侧操作按钮随气泡垂直居中 */
 }
 
 .message-user {
@@ -1200,17 +1371,33 @@ function goBack() {
   }
 }
 
+/* 播放/停止操作区：消息气泡右侧、垂直居中的小圆按钮（仅 AI 消息） */
 .message-actions {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--c-divider);
   display: flex;
-  gap: 14px;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0; /* 长文本时按钮不被压缩 */
 
   .action-btn {
-    font-size: 12px;
-    color: var(--c-primary);
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: var(--c-mint-bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
     cursor: pointer;
+    transition: transform 0.15s ease, background 0.2s ease;
+
+    &:active {
+      transform: scale(0.92);
+    }
+
+    &.playing {
+      background: var(--c-red-text); /* 播放中：红色圆钮（停止态），直观区分 */
+      color: #fff;
+    }
   }
 }
 

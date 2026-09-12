@@ -93,7 +93,7 @@
         :key="item.id"
         class="word-card"
         :ref="(el) => setItemRef(el, i)"
-        @click="showReview(item)"
+        @click="showWordDetail(item)"
       >
         <div class="item-top">
           <div class="item-left">
@@ -114,7 +114,7 @@
         <div class="item-footer">
           <span class="review-label" v-if="item.next_review_at">{{ formatReviewTime(item.next_review_at) }}</span>
           <span class="review-label" v-else>新收录</span>
-          <div class="sound-btn">
+          <div class="sound-btn" @click.stop="playWordSound(item.content)">
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
               <path d="M3 5.5H5L8 3V11L5 8.5H3V5.5Z" stroke="#0DBA9C" stroke-width="1.5" stroke-linejoin="round"/>
               <path d="M10 4.5C11 5.2 11 8.8 10 9.5" stroke="#0DBA9C" stroke-width="1.5" stroke-linecap="round"/>
@@ -211,6 +211,40 @@
         </div>
       </div>
     </van-popup>
+
+    <!-- 单词详解弹窗（点击生词卡进入：音标/释义/例句 + 发音 + 复习入口） -->
+    <van-popup v-model:show="showDetail" position="bottom" round :style="{ background: 'transparent' }" :close-on-click-overlay="true" @click-overlay="showDetail = false">
+      <div class="word-dialog">
+        <div class="popup-handle"></div>
+        <div class="word-dialog-head">
+          <span class="popup-title-icon">
+            <svg width="18" height="18" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M4 3H14V15H4V3Z" stroke="#FFFFFF" stroke-width="1.8" stroke-linejoin="round"/>
+              <path d="M6 6H12M6 8.5H12M6 11H9.5" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
+          </span>
+          <span class="popup-title">单词详解</span>
+        </div>
+        <div class="word-dialog-body">
+          <div class="wd-word-row">
+            <span class="wd-word">{{ detailInfo?.word ?? detailItem?.content }}</span>
+            <span class="wd-phonetic" v-if="detailInfo?.phonetic">{{ detailInfo.phonetic }}</span>
+            <span class="wd-sound" @click="playWordSound((detailInfo?.word ?? detailItem?.content)!)">
+              <svg width="16" height="16" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M3 5.5H5L8 3V11L5 8.5H3V5.5Z" stroke="#0DBA9C" stroke-width="1.5" stroke-linejoin="round"/>
+                <path d="M10 4.5C11 5.2 11 8.8 10 9.5" stroke="#0DBA9C" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+            </span>
+          </div>
+          <div class="wd-meaning">{{ detailInfo?.meaning || "暂无释义" }}</div>
+          <div class="wd-example" v-if="detailInfo?.example">{{ detailInfo.example }}</div>
+        </div>
+        <div class="word-dialog-actions">
+          <button class="wd-btn wd-btn-close" @click="showDetail = false">关闭</button>
+          <button class="wd-btn wd-btn-add" @click="startReviewFromDetail">开始复习</button>
+        </div>
+      </div>
+    </van-popup>
   </div>
 </template>
 
@@ -219,7 +253,7 @@ import { ref, computed, onMounted, onActivated } from "vue";
 import { useRouter } from "vue-router";
 import { showToast, showSuccessToast } from "vant";
 import gsap from "gsap";
-import { learningApi } from "@/api";
+import { learningApi, conversationApi, speechApi } from "@/api";
 import level1Icon from "@/assets/icons/level-1.svg";
 import level2Icon from "@/assets/icons/level-2.svg";
 import level3Icon from "@/assets/icons/level-3.svg";
@@ -414,6 +448,49 @@ function loadMore() {
 function showReview(item: LearningItem) {
   currentItem.value = item;
   showReviewPopup.value = true;
+}
+
+// ── 单词详解弹窗（2026-08-22：生词本点击词卡进入详情解释）──
+const showDetail = ref(false);
+const detailItem = ref<LearningItem | null>(null);
+const detailInfo = ref<{ word: string; phonetic: string; meaning: string; example: string } | null>(null);
+
+/** 点击生词卡 → 打开单词详解：先用生词本已存释义即时展示（不闪烁），
+ *  再调 LLM 词典（explainWord）补全音标/例句覆盖展示 */
+async function showWordDetail(item: LearningItem) {
+  detailItem.value = item;
+  detailInfo.value = {
+    word: item.content,
+    phonetic: item.phonetic ?? "",
+    meaning: item.meaning ?? "暂无释义",
+    example: "",
+  };
+  showDetail.value = true;
+  try {
+    const info = await conversationApi.explainWord(item.content);
+    detailInfo.value = { ...detailInfo.value, ...info };
+  } catch {
+    /* 查询失败保留本地数据（不打断详情查看） */
+  }
+}
+
+/** 详情弹窗 → 复习：关闭详情并打开复习弹窗（复用原复习链路） */
+function startReviewFromDetail() {
+  showDetail.value = false;
+  if (detailItem.value) showReview(detailItem.value);
+}
+
+/** 播放单词发音（TTS 合成，与词卡/详情弹窗发音按钮共用；失败静默） */
+async function playWordSound(word: string) {
+  try {
+    const blob = await speechApi.synthesize(word, undefined, 1);
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.onended = () => URL.revokeObjectURL(url);
+    audio.play().catch(() => {});
+  } catch {
+    /* 合成失败静默：单词发音非关键路径 */
+  }
 }
 
 /** 提交复习结果：用返回的 mastery/next_review_at 局部更新列表项（无需整页刷新） */
@@ -1106,6 +1183,138 @@ function formatReviewTime(dateStr: string) {
     background: rgba(13, 186, 156, 0.14);
     border-color: var(--c-primary);
     color: var(--c-primary-deep);
+  }
+}
+
+/* 单词详解弹窗（与聊天页点词弹窗同风格：白底圆角 + 薄荷绿主题） */
+.word-dialog {
+  background: #fff;
+  border-radius: 24px 24px 0 0;
+  padding: 12px 20px calc(24px + env(safe-area-inset-bottom));
+
+  .popup-handle {
+    width: 36px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--c-divider);
+    margin: 0 auto 16px;
+  }
+
+  .word-dialog-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 14px;
+
+    .popup-title-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 12px;
+      background: var(--grad-brand);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      box-shadow: 0 4px 10px rgba(13, 186, 156, 0.28);
+    }
+
+    .popup-title {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--c-text);
+    }
+  }
+
+  .word-dialog-body {
+    min-height: 96px;
+    padding: 16px;
+    border-radius: 14px;
+    background: var(--c-mint-bg);
+    box-sizing: border-box;
+
+    .wd-word-row {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+
+      .wd-word {
+        font-size: 22px;
+        font-weight: 700;
+        color: var(--c-text);
+      }
+
+      .wd-phonetic {
+        font-size: 13px;
+        color: var(--c-text-sub);
+      }
+
+      .wd-sound {
+        margin-left: auto;
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        background: #fff;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        box-shadow: 0 2px 8px rgba(13, 186, 156, 0.22);
+        transform: translateY(4px);
+        transition: transform 0.15s ease;
+
+        &:active {
+          transform: translateY(4px) scale(0.9);
+        }
+      }
+    }
+
+    .wd-meaning {
+      font-size: 14px;
+      line-height: 1.6;
+      color: var(--c-text);
+      margin-top: 10px;
+    }
+
+    .wd-example {
+      font-size: 12px;
+      line-height: 1.6;
+      color: var(--c-text-sub);
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px dashed var(--c-divider);
+    }
+  }
+
+  .word-dialog-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 18px;
+
+    .wd-btn {
+      flex: 1;
+      height: 48px;
+      border-radius: var(--radius-pill);
+      font-size: 15px;
+      font-weight: 600;
+      border: none;
+      cursor: pointer;
+      transition: transform 0.15s ease, opacity 0.2s ease;
+
+      &:active {
+        transform: scale(0.97);
+      }
+    }
+
+    .wd-btn-close {
+      background: var(--c-mint-bg);
+      color: var(--c-text-sub);
+    }
+
+    .wd-btn-add {
+      background: var(--grad-brand);
+      color: #fff;
+      box-shadow: 0 6px 16px rgba(13, 186, 156, 0.3);
+    }
   }
 }
 </style>

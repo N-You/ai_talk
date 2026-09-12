@@ -116,6 +116,8 @@ export const userApi = {
     dailyWordGoal?: number;
     speed?: number;
     temperature?: number;
+    /** 识别语言（language 配置表 code，见 src/config/languages.ts）；影响 ASR 语言提示 */
+    language?: string;
   }) => request<any>({ url: "/api/user/settings", method: "PUT", data }),
 };
 
@@ -133,10 +135,16 @@ export const conversationApi = {
   create: (scenarioId: number) =>
     request<any>({ url: "/api/conversations", method: "POST", data: { scenario_id: scenarioId } }),
   list: () => request<any[]>({ url: "/api/conversations" }),
+  /** 某主题（场景）下的全部对话线程：{ id, title, scenario_name, message_count, started_at, ended_at } */
+  listByScenario: (scenarioId: number) =>
+    request<any[]>({ url: `/api/scenarios/${scenarioId}/conversations` }),
   detail: (id: number) => request<any>({ url: `/api/conversations/${id}` }),
   end: (id: number, data: any) =>
     request<any>({ url: `/api/conversations/${id}/end`, method: "PUT", data }),
-  /** 删除会话（消息级联删除；仅能删自己的） */
+  /** 更新线程标题（重命名对话组） */
+  updateTitle: (id: number, title: string) =>
+    request<any>({ url: `/api/conversations/${id}`, method: "PUT", data: { title } }),
+  /** 删除线程（整组删除：会话及其全部消息上下文，DB 外键级联；仅能删自己的） */
   delete: (id: number) =>
     request<any>({ url: `/api/conversations/${id}`, method: "DELETE" }),
   /** 单词释义查询（对话中点击单词弹窗）：返回 { word, phonetic, meaning, example } */

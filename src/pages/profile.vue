@@ -128,6 +128,20 @@
         </div>
       </div>
 
+      <!-- 识别语言（影响语音识别/朗读的语言提示；中文母语用户可选目标语言提升准确率） -->
+      <div class="setting-row">
+        <div class="setting-left">
+          <div class="setting-label">识别语言</div>
+          <div class="setting-desc">选择练习的目标语言，识别更准确</div>
+        </div>
+        <div class="accent-picker" @click="cycleLang">
+          <span>{{ langLabel }}</span>
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M2 3.5L5 6.5L8 3.5" stroke="#0B3B33" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+      </div>
+
       <!-- 对话风格 Temperature -->
       <div class="setting-block">
         <div class="setting-head">
@@ -253,6 +267,7 @@ import { ref, reactive, computed, onMounted, onActivated } from "vue";
 import { showToast, showSuccessToast } from "vant";
 import gsap from "gsap";
 import { authApi, userApi, getToken, setToken, clearToken } from "@/api";
+import { LANGUAGE_CONFIGS, getLanguageConfig } from "@/config/languages";
 import iconMascotStand from "@/assets/icons/mascot-stand.svg";
 
 const isLoggedIn = ref(false);
@@ -331,6 +346,12 @@ const accents = ["美式", "英式", "澳式"];
 const accentIdx = ref(0);
 const accentLabel = computed(() => accents[accentIdx.value % accents.length]);
 
+// 识别语言（settings.language，见 config/languages.ts；默认"自动识别"——
+// 中英混说是中文母语学习者常态，后端已用 language_hints=["en","zh"] 兼顾
+// 短英文词与中文；纯单语种场景可切"英语"/"中文"强制提升）
+const langCode = ref("auto");
+const langLabel = computed(() => getLanguageConfig(langCode.value).label);
+
 const temperatureLabel = computed(() => {
   if (temperature.value < 0.4) return "严谨";
   if (temperature.value <= 1) return "平衡";
@@ -359,8 +380,18 @@ function onTempChange(v: number | string) {
   saveSetting({ temperature: temperature.value });
 }
 
+/** 点击切换识别语言（英语 → 自动识别 → 中文 → ...循环），选择即保存。
+ *  默认"英语"（产品是英语陪练，显式 language=en 压掉中文母语先验，短英文词不再误识别成中文）；
+ *  中英混合场景切"自动识别"（官方建议混合不指定语言）。 */
+function cycleLang() {
+  const idx = LANGUAGE_CONFIGS.findIndex((l) => l.code === langCode.value);
+  const next = LANGUAGE_CONFIGS[(idx + 1) % LANGUAGE_CONFIGS.length];
+  langCode.value = next.code;
+  saveSetting({ language: next.code });
+}
+
 /** 保存单个设置字段（未登录仅本地生效，不持久化） */
-function saveSetting(patch: { speed?: number; temperature?: number }) {
+function saveSetting(patch: { speed?: number; temperature?: number; language?: string }) {
   if (!getToken()) return;
   userApi.updateSettings(patch).catch(() => showToast("设置保存失败"));
 }
@@ -460,6 +491,10 @@ async function loadSettings() {
     }
     if (typeof s.temperature === "number") {
       temperature.value = Math.min(1.5, Math.max(0, s.temperature));
+    }
+    // 识别语言（未设置 → 默认"英语"）
+    if (typeof s.language === "string" && getLanguageConfig(s.language)) {
+      langCode.value = s.language;
     }
     const hasUser = s.apiKey || s.apiBase || s.model;
     if (hasUser) {

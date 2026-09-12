@@ -100,6 +100,8 @@ import iconPlane from "@/assets/icons/icon-plane.svg";
 import iconInterview from "@/assets/icons/icon-interview.svg";
 import iconRestaurant from "@/assets/icons/icon-restaurant.svg";
 import iconHotel from "@/assets/icons/icon-hotel.svg";
+import iconShopping from "@/assets/icons/icon-shopping.svg";
+import iconChat from "@/assets/icons/icon-chat.svg";
 import iconDefault from "@/assets/icons/icon-default.svg";
 import iconTrash from "@/assets/icons/icon-trash.svg";
 
@@ -175,6 +177,8 @@ const lastScene = computed(() => ({
 /** 最近会话的场景图标：按场景名匹配卡通图标（与场景库一致） */
 const sceneIcon = computed(() => {
   const name = lastConversation.value?.scenario_name ?? "";
+  if (name.includes("购物") || name.includes("shopping") || name.includes("Shopping") || name.includes("商店")) return iconShopping;
+  if (name.includes("日常") || name.includes("聊天") || name.includes("Daily") || name.includes("daily") || name.includes("对话")) return iconChat;
   if (name.includes("咖啡") || name.includes("café") || name.includes("Cafe")) return iconCoffee;
   if (name.includes("机场") || name.includes("flight") || name.includes("Flight") || name.includes("值机")) return iconPlane;
   if (name.includes("面试") || name.includes("interview") || name.includes("Interview")) return iconInterview;
@@ -209,7 +213,7 @@ async function deleteConversation() {
   try {
     await showConfirmDialog({
       title: "删除对话",
-      message: `确定删除「${lastConversation.value.scenario_name}」的这段对话记录吗？删除后不可恢复。`,
+      message: `确定删除「${lastConversation.value.scenario_name}」的这次对话吗？将清空该会话的全部对话记录（上下文），删除后不可恢复。`,
       confirmButtonText: "删除",
       cancelButtonText: "取消",
     });
@@ -218,8 +222,11 @@ async function deleteConversation() {
   }
   try {
     await conversationApi.delete(lastConversation.value.id);
+    // 立即清空卡片数据：避免"已删除"toast 已弹出但卡片仍显示旧会话的错位
+    // （此时用户点击卡片会带着已删除的 conversationId 进 chat 页报"初始化失败"）
+    lastConversation.value = null;
     showSuccessToast("已删除");
-    loadConversations();
+    await loadConversations(); // 重拉：若还有更早会话则顶上来，否则卡片消失
   } catch {
     showToast("删除失败");
   }
